@@ -1,0 +1,26 @@
+.vercel
+*.log
+*.pyc
+__pycache__
+
+# Environments 
+.env 
+.venv 
+env/ 
+venv/ 
+ENV/ 
+env.bak/ 
+venv.bak/ 
+.direnv
+variables.txt
+.DS_Store
+.envrc
+.vscode
+.env*.local
+*.conf
+*.db
+*.log
+*.wav
+*.mp3
+*.json
+models/*
