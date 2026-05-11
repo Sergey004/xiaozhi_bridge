@@ -27,6 +27,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from scipy import signal as scipy_signal
+import hashlib
 
 # ─── Логгер ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -419,3 +420,36 @@ async def root():
             "health": "GET /health",
         },
     }
+
+
+# ─── OTA ────────────────────────────
+
+OTA_FIRMWARE_PATH = "firmware/xiaozhi.bin"
+
+@app.get("/ota/version")
+async def ota_version():
+    """Девайс проверяет версию при старте"""
+    return {
+        "version": "1.0.1",
+        "url": "http://your-server:8000/ota/firmware"
+    }
+
+@app.get("/ota/firmware")
+async def ota_firmware():
+    """Отдаёт бинарник прошивки"""
+    if not os.path.exists(OTA_FIRMWARE_PATH):
+        raise HTTPException(404, "No firmware available")
+    return FileResponse(
+        OTA_FIRMWARE_PATH,
+        media_type="application/octet-stream",
+        filename="xiaozhi.bin"
+    )
+
+@app.post("/ota/upload")
+async def ota_upload(file: UploadFile = File(...)):
+    """Загрузить новую прошивку на сервер"""
+    os.makedirs("firmware", exist_ok=True)
+    content = await file.read()
+    with open(OTA_FIRMWARE_PATH, "wb") as f:
+        f.write(content)
+    return {"status": "ok", "size": len(content)}
