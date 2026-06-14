@@ -30,7 +30,7 @@ except Exception as e:
 
 # Проверка доступности RVC
 try:
-    from ai_core.rvc_py.rvc_infer import rvc_infer
+    from rvc_py.rvc_infer import rvc_infer
 except ImportError:
     rvc_infer = None
 
@@ -38,7 +38,26 @@ logging.getLogger("numba").setLevel(logging.ERROR)
 logging.getLogger("numba.core.byteflow").setLevel(logging.ERROR)
 
 
-class TTSAdapter:
+def create_tts_adapter(config: dict, logger: logging.Logger):
+    """
+    Фабрика: создаёт TTS адаптер в зависимости от engine.
+    Поддерживает: 'turbo', 'base', 'multilingual', 'dramabox'
+    """
+    tts_cfg = config.get("tts", {})
+    engine = tts_cfg.get("engine", "turbo").lower()
+
+    if engine == "dramabox":
+        from dramabox_adapter import DramaBoxAdapter
+        logger.info("🎭 TTS engine: DramaBox (expressive, 24GB VRAM)")
+        return DramaBoxAdapter(config, logger)
+    else:
+        logger.info(f"🔊 TTS engine: Chatterbox-{engine}")
+        return ChatterboxAdapter(config, logger)
+
+
+class ChatterboxAdapter:
+    """Оригинальный Chatterbox TTS адаптер (turbo/base/multilingual)."""
+
     def __init__(self, config: dict, logger: logging.Logger):
         self.config = config
         self.logger = logger.getChild("TTS")

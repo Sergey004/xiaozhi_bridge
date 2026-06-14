@@ -1,16 +1,6 @@
 from typing import List
 import numpy as np
 import torch
-
-try:
-    # Fix "Torch not compiled with CUDA enabled"
-
-    if torch.xpu.is_available():
-        from rvc_python.modules.ipex import ipex_init
-
-        ipex_init()
-except Exception:  # pylint: disable=broad-exception-caught
-    pass
 import torch.nn as nn
 import torch.nn.functional as F
 from librosa.util import pad_center
@@ -150,8 +140,6 @@ class STFT(torch.nn.Module):
         reconstruction = self.inverse(self.magnitude, self.phase)
         return reconstruction
 
-
-from time import time as ttime
 
 
 class BiGRU(nn.Module):
@@ -583,24 +571,6 @@ class RMVPE:
         return devided
 
 
-# Удаление блока if __name__ == "__main__":
-
 def extract_f0_rmvpe(wav, sr, rmvpe_model_path, device='cpu'):
     rmvpe = RMVPE(rmvpe_model_path, device=device)
     return rmvpe.infer(wav, sr)
-
-
-    if sampling_rate != 16000:
-        audio = librosa.resample(audio, orig_sr=sampling_rate, target_sr=16000)
-    model_path = r"D:\BaiduNetdiskDownload\RVC-beta-v2-0727AMD_realtime\rmvpe.pt"
-    thred = 0.03  # 0.01
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    rmvpe = RMVPE(model_path, is_half=False, device=device)
-    t0 = ttime()
-    f0 = rmvpe.infer_from_audio(audio, thred=thred)
-    # f0 = rmvpe.infer_from_audio(audio, thred=thred)
-    # f0 = rmvpe.infer_from_audio(audio, thred=thred)
-    # f0 = rmvpe.infer_from_audio(audio, thred=thred)
-    # f0 = rmvpe.infer_from_audio(audio, thred=thred)
-    t1 = ttime()
-    logger.info("%s %.2f", f0.shape, t1 - t0)

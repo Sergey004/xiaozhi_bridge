@@ -4,10 +4,9 @@ librosa
 soundfile
 scipy
 torchcrepe
-faiss-cpu
+faiss-cpu==1.7.4
 praat-parselmouth>=0.4.2
 onnxruntime
 pyworld
-git+https://github.com/One-sixth/fairseq.git
 tensorboardX
-faiss-cpu==1.7.4
+git+https://github.com/One-sixth/fairseq.git

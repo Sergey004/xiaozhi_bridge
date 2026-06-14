@@ -8,8 +8,8 @@ import asyncio
 import datetime
 from typing import Optional
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from ai_core.document_processor import DocumentProcessor
-from ai_core.ai_config import DEFAULT_PROMPT
+from document_processor import DocumentProcessor
+from ai_config import DEFAULT_PROMPT
 
 try:
     from langchain_nvidia_ai_endpoints import ChatNVIDIA

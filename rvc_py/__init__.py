@@ -1,2 +1,3 @@
-# RVC module is imported by tts_adapter.py when needed
-pass
+from .rvc_infer import rvc_infer
+
+__all__ = ["rvc_infer"]
