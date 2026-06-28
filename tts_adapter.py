@@ -29,9 +29,10 @@ except Exception as e:
     _chatterbox_error = str(e)
 
 # Проверка доступности RVC
+# ВАЖНО: импортируем функцию из модуля, а не сам модуль
 try:
     from rvc_py.rvc_infer import rvc_infer
-except ImportError:
+except Exception:
     rvc_infer = None
 
 logging.getLogger("numba").setLevel(logging.ERROR)
@@ -120,7 +121,7 @@ class ChatterboxAdapter:
                     "Try reinstalling: pip uninstall chatterbox-tts && pip install chatterbox-tts"
                 )
             raise
-        
+
         return self._model
 
     async def check_health(self) -> bool:
@@ -131,7 +132,6 @@ class ChatterboxAdapter:
                 )
                 return False
             await asyncio.get_event_loop().run_in_executor(None, self._get_model)
-            # Прогрев RVC — здесь можно await
             self.logger.info("🔥 Warming up TTS+RVC pipeline...")
             await self.synthesize("Hello.")
             self.logger.info("✅ TTS+RVC warm.")
@@ -142,14 +142,15 @@ class ChatterboxAdapter:
 
     async def synthesize(self, text: str):
         """
-        Возвращает кортеж: (PCM_BYTES, SAMPLE_RATE)
+        Полный синтез: возвращает кортеж (PCM_BYTES, SAMPLE_RATE).
+        Используется для офлайн/батч режима.
         """
         try:
             model = await asyncio.get_event_loop().run_in_executor(
                 None, self._get_model
             )
 
-            # 1. Генерация TTS (обычно 24k или 16k)
+            # 1. Генерация TTS
             def _generate():
                 if isinstance(model, ChatterboxMultilingualTTS) and self.language_id:
                     return model.generate(
@@ -171,7 +172,7 @@ class ChatterboxAdapter:
             else:
                 wave = np.array(wav)
 
-            # 2. RVC Обработка (Если включена)
+            # 2. RVC обработка (если включена)
             if self.rvc_enabled and self.rvc_model_path and rvc_infer:
                 try:
                     wave_np = np.asarray(wave)
@@ -181,8 +182,6 @@ class ChatterboxAdapter:
                         wave_np = wave_np.reshape(-1)
                     wave_np = wave_np.astype(np.float32, copy=False)
 
-                    # Вызываем RVC
-                    # RVC возвращает звук и НОВУЮ частоту (40000 или 48000)
                     rvc_result = await asyncio.get_event_loop().run_in_executor(
                         None,
                         lambda: rvc_infer(
@@ -197,18 +196,13 @@ class ChatterboxAdapter:
                         ),
                     )
 
-                    # ЗАЩИТА ОТ РАЗНЫХ ВЕРСИЙ RVC
-                    # Некоторые возвращают (audio, sr), некоторые (sr, audio)
+                    # rvc_infer возвращает (audio_np, sample_rate)
                     if len(rvc_result) == 2:
                         val1, val2 = rvc_result
-                        # Если первое число - это частота (int > 1000)
                         if isinstance(val1, int) and val1 > 1000:
-                            sr = val1
-                            wave = val2
-                        # Если второе число - это частота
+                            sr, wave = val1, val2
                         elif isinstance(val2, int) and val2 > 1000:
-                            wave = val1
-                            sr = val2
+                            wave, sr = val1, val2
 
                 except Exception as e:
                     self.logger.error(f"RVC Error (skipping): {e}", exc_info=True)
@@ -233,9 +227,89 @@ class ChatterboxAdapter:
             self.logger.error(f"Synthesis failed: {e}", exc_info=True)
             return b"", 16000
 
+    async def synthesize_stream(self, text: str):
+        """
+        Async generator: выдаёт (np.ndarray float32, sample_rate) чанками.
+
+        Пробует использовать нативный стриминг Chatterbox если доступен,
+        иначе fallback — генерирует полностью и выдаёт одним чанком.
+
+        Используется с RVCStreamer для pipeline стриминга:
+            async for chunk_np, sr in adapter.synthesize_stream(text):
+                converted = rvc_streamer.push(chunk_np)
+                if converted is not None:
+                    await send(converted)
+        """
+        loop = asyncio.get_event_loop()
+
+        try:
+            model = await loop.run_in_executor(None, self._get_model)
+        except Exception as e:
+            self.logger.error(f"synthesize_stream: model load failed: {e}")
+            return
+
+        sr = getattr(model, "sr", 24000)
+
+        # Попытка нативного стриминга Chatterbox
+        stream_fn = getattr(model, "generate_stream", None)
+
+        if stream_fn is not None:
+            # Нативный стриминг — генерирует чанками в отдельном потоке
+            self.logger.debug("synthesize_stream: using native generate_stream")
+            q: asyncio.Queue = asyncio.Queue()
+
+            def _producer():
+                try:
+                    for chunk in stream_fn(
+                        text,
+                        audio_prompt_path=self.audio_prompt_path,
+                    ):
+                        if isinstance(chunk, torch.Tensor):
+                            arr = chunk.detach().cpu().numpy().squeeze().astype(np.float32)
+                        else:
+                            arr = np.asarray(chunk).squeeze().astype(np.float32)
+                        loop.call_soon_threadsafe(q.put_nowait, (arr, sr))
+                except Exception as exc:
+                    self.logger.error(f"synthesize_stream producer error: {exc}")
+                finally:
+                    loop.call_soon_threadsafe(q.put_nowait, None)  # sentinel
+
+            await loop.run_in_executor(None, _producer)
+
+            while True:
+                item = await q.get()
+                if item is None:
+                    break
+                yield item
+
+        else:
+            # Fallback: полная генерация → один большой чанк
+            self.logger.debug("synthesize_stream: fallback to full generate()")
+
+            def _generate_full():
+                if isinstance(model, ChatterboxMultilingualTTS) and self.language_id:
+                    return model.generate(
+                        text,
+                        language_id=self.language_id,
+                        audio_prompt_path=self.audio_prompt_path,
+                        cfg_weight=0.3,
+                    )
+                return model.generate(
+                    text, audio_prompt_path=self.audio_prompt_path, cfg_weight=0.3
+                )
+
+            try:
+                wav = await loop.run_in_executor(None, _generate_full)
+                if isinstance(wav, torch.Tensor):
+                    arr = wav.detach().cpu().numpy().squeeze().astype(np.float32)
+                else:
+                    arr = np.asarray(wav).squeeze().astype(np.float32)
+                yield arr, sr
+            except Exception as e:
+                self.logger.error(f"synthesize_stream fallback failed: {e}")
+
     async def speak(self, text: str, media_port):
         async with self._speak_lock:
-            # Получаем байты И точную частоту (sr)
             pcm_data, sr = await self.synthesize(text)
 
             if not pcm_data:
@@ -244,15 +318,17 @@ class ChatterboxAdapter:
             if media_port is None:
                 return
 
-            # Передаем частоту (sr) в Bridge!
             self.logger.info(
                 f"Sending audio to bridge: {len(pcm_data)} bytes at {sr} Hz"
             )
 
-            # Bridge сам сделает 48000 -> 8000 или 40000 -> 8000
             success = media_port.update_playback_data(
                 pcm_data, sample_rate=sr, validate=True
             )
 
             if not success:
                 self.logger.error("Failed to update bridge playback data")
+
+
+# Алиас для обратной совместимости с проектами использующими TTSAdapter
+TTSAdapter = ChatterboxAdapter
