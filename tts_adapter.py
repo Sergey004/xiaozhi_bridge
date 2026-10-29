@@ -254,16 +254,26 @@ class ChatterboxAdapter:
         stream_fn = getattr(model, "generate_stream", None)
 
         if stream_fn is not None:
-            # Нативный стриминг — генерирует чанками в отдельном потоке
+            # Нативный стриминг — продюсер работает в отдельном потоке
+            # ПАРАЛЛЕЛЬНО с чтением очереди (await на нём здесь убил бы стриминг:
+            # все чанки накопились бы до первого yield)
             self.logger.debug("synthesize_stream: using native generate_stream")
             q: asyncio.Queue = asyncio.Queue()
 
             def _producer():
                 try:
-                    for chunk in stream_fn(
-                        text,
-                        audio_prompt_path=self.audio_prompt_path,
-                    ):
+                    if isinstance(model, ChatterboxMultilingualTTS) and self.language_id:
+                        chunks = stream_fn(
+                            text,
+                            audio_prompt_path=self.audio_prompt_path,
+                            language_id=self.language_id,
+                        )
+                    else:
+                        chunks = stream_fn(
+                            text,
+                            audio_prompt_path=self.audio_prompt_path,
+                        )
+                    for chunk in chunks:
                         if isinstance(chunk, torch.Tensor):
                             arr = chunk.detach().cpu().numpy().squeeze().astype(np.float32)
                         else:
@@ -274,7 +284,7 @@ class ChatterboxAdapter:
                 finally:
                     loop.call_soon_threadsafe(q.put_nowait, None)  # sentinel
 
-            await loop.run_in_executor(None, _producer)
+            loop.run_in_executor(None, _producer)
 
             while True:
                 item = await q.get()

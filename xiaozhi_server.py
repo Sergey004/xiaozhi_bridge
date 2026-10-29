@@ -109,8 +109,30 @@ TOOL_CALL_MODE = os.getenv("TOOL_CALL_MODE", "function_call")  # function_call |
 # Listen mode
 DEFAULT_LISTEN_MODE = os.getenv("LISTEN_MODE", "auto")  # auto | manual
 
-# TTS streaming
-TTS_STREAMING = os.getenv("TTS_STREAMING", "true").lower() == "true"
+# TTS streaming: true/sentence — по предложениям (батч TTS),
+# chunk — стриминг TTS+RVC блоками через RVCStreamer, false/off — чистый батч
+_raw_tts_streaming = os.getenv("TTS_STREAMING", "true").strip().lower()
+if _raw_tts_streaming in ("chunk", "rvc", "block"):
+    TTS_STREAMING_MODE = "chunk"
+elif _raw_tts_streaming in ("false", "off", "0", "no", "batch"):
+    TTS_STREAMING_MODE = "batch"
+else:  # true / sentence / 1 / yes
+    TTS_STREAMING_MODE = "sentence"
+TTS_STREAMING = TTS_STREAMING_MODE != "batch"  # совместимость со старыми проверками
+
+# Параметры стримингового RVC (rvc_py.realtime.RVCStreamer)
+RVC_STREAM_BLOCK_MS = int(os.getenv("RVC_STREAM_BLOCK_MS", "300"))
+RVC_STREAM_OVERLAP = int(os.getenv("RVC_STREAM_OVERLAP", "1024"))
+RVC_STREAM_CROSSFADE = int(os.getenv("RVC_STREAM_CROSSFADE", "512"))
+_raw_vad_db = os.getenv("RVC_STREAM_VAD_DB", "-45").strip().lower()
+RVC_STREAM_VAD_DB = None if _raw_vad_db in ("", "none", "off") else float(_raw_vad_db)
+# Контекст слева для HuBERT/F0 (сэмплы @16кГц). 0 = как в либе по умолчанию,
+# 40000 (2.5s) — рекомендация автора rvc_py для стабильного голоса на фразах
+RVC_STREAM_EXTRA_FRAME = int(os.getenv("RVC_STREAM_EXTRA_FRAME", "0"))
+
+# Порция подачи PCM в RVCStreamer (~100мс @16кГц): push() за вызов
+# обрабатывает один блок, поэтому батчевый чанк от TTS нужно резать
+RVC_STREAM_SLICE = 1600
 
 # EdgeTTS voice
 EDGETTS_VOICE = os.getenv("EDGETTS_VOICE", "ru-RU-SvetlanaNeural")
@@ -434,6 +456,7 @@ class AudioRateController:
         self._queue: asyncio.Queue = asyncio.Queue()
         self._sending = False
         self._send_task = None
+        self._pcm_remainder = b""  # хвост < кадра между enqueue_pcm (стриминг)
 
     async def start(self, ws, opus_encoder=None):
         self._ws = ws
@@ -450,22 +473,51 @@ class AudioRateController:
                 pass
 
     async def enqueue(self, wav_bytes: bytes):
-        pcm_data = _normalize_wav_to_16k(wav_bytes)
+        """Батч-режим: WAV-байты → normalize → кадры. Хвост дополняется нулями."""
+        await self._queue_pcm(_normalize_wav_to_16k(wav_bytes))
+        await self.flush_pcm()
+
+    async def enqueue_pcm(self, pcm_bytes: bytes):
+        """Стриминг: PCM 16kHz mono int16 напрямую (уже прошёл RVC/ресэмплинг).
+        Неполный кадр держится в буфере до flush_pcm(), чтобы не вставлять
+        тишину в середину потока."""
+        await self._queue_pcm(pcm_bytes)
+
+    async def flush_pcm(self):
+        """Дополнить остаток до полного кадра нулями и поставить в очередь."""
+        if not self._pcm_remainder:
+            return
+        tail = self._pcm_remainder
+        self._pcm_remainder = b""
+        if len(tail) < FRAME_BYTES:
+            tail = tail + b'\x00' * (FRAME_BYTES - len(tail))
+        if self._opus_encoder:
+            try:
+                await self._queue.put(self._opus_encoder.encode(tail, FRAME_SAMPLES))
+            except Exception:
+                pass
+        else:
+            await self._queue.put(tail)
+
+    async def _queue_pcm(self, pcm_data: bytes):
+        if self._pcm_remainder:
+            pcm_data = self._pcm_remainder + pcm_data
+            self._pcm_remainder = b""
+        complete = len(pcm_data) - (len(pcm_data) % FRAME_BYTES)
+        if complete <= 0:
+            self._pcm_remainder = pcm_data
+            return
         frames = []
         if self._opus_encoder:
-            for i in range(0, len(pcm_data), FRAME_BYTES):
-                chunk = pcm_data[i:i + FRAME_BYTES]
-                if len(chunk) < FRAME_BYTES:
-                    chunk = chunk + b'\x00' * (FRAME_BYTES - len(chunk))
+            for i in range(0, complete, FRAME_BYTES):
                 try:
-                    frames.append(self._opus_encoder.encode(chunk, FRAME_SAMPLES))
+                    frames.append(self._opus_encoder.encode(pcm_data[i:i + FRAME_BYTES], FRAME_SAMPLES))
                 except Exception:
                     break
         else:
-            for i in range(0, len(pcm_data), FRAME_BYTES):
-                chunk = pcm_data[i:i + FRAME_BYTES]
-                if chunk:
-                    frames.append(chunk)
+            for i in range(0, complete, FRAME_BYTES):
+                frames.append(pcm_data[i:i + FRAME_BYTES])
+        self._pcm_remainder = pcm_data[complete:]
         for frame in frames:
             await self._queue.put(frame)
 
@@ -637,7 +689,31 @@ EMOTION_TAG_TO_TTS = {
     "[stutter]": "U-uh... ", "[stammers]": "U-uh... ",
 }
 
-EMOTION_TAG_TO_DRAMABOX = {
+# Chatterbox Turbo понимает [tag] нативно — конвертация не нужна,
+# достаточно убрать неизвестные теги и нормализовать известные.
+EMOTION_TAGS_TURBO = {
+    "[laugh]", "[laughs]", "[chuckle]", "[chuckles]",
+    "[gasp]", "[gasps]", "[sigh]", "[sighs]",
+    "[cough]", "[coughs]", "[groan]", "[groans]",
+    "[sniff]", "[sniffs]", "[clear throat]", "[shush]",
+    "[yawn]", "[yawns]", "[hum]", "[hums]",
+}
+
+# Нормализация LLM-вариантов → канонический тег для Turbo
+EMOTION_TAG_NORMALIZE = {
+    "[laughs]": "[laugh]", "[chuckles]": "[chuckle]",
+    "[gasps]": "[gasp]", "[sighs]": "[sigh]",
+    "[coughs]": "[cough]", "[groans]": "[groan]",
+    "[sniffs]": "[sniff]", "[yawns]": "[yawn]",
+    "[hums]": "[hum]", "[clears throat]": "[clear throat]",
+    "[stammers]": "[sigh]",
+}
+
+# Пол персонажа для DramaBox (She/He)
+# Управляется через: DRAMABOX_GENDER=male или DRAMABOX_GENDER=female (по умолчанию)
+DRAMABOX_GENDER = os.getenv("DRAMABOX_GENDER", "female").lower().strip()
+
+EMOTION_TAG_TO_DRAMABOX_FEMALE = {
     "[laugh]": ("She laughs,", '"Hahaha,"'),
     "[laughs]": ("She laughs,", '"Hahaha,"'),
     "[chuckle]": ("She chuckles,", '"Hehe,"'),
@@ -655,6 +731,31 @@ EMOTION_TAG_TO_DRAMABOX = {
     "[stammers]": ("She stammers,", '"I... I..."'),
 }
 
+EMOTION_TAG_TO_DRAMABOX_MALE = {
+    "[laugh]": ("He laughs,", '"Hahaha,"'),
+    "[laughs]": ("He laughs,", '"Hahaha,"'),
+    "[chuckle]": ("He chuckles,", '"Hehe,"'),
+    "[chuckles]": ("He chuckles,", '"Hehe,"'),
+    "[gasp]": ("He gasps,", ""), "[gasps]": ("He gasps,", ""),
+    "[sigh]": ("He sighs deeply,", ""), "[sighs]": ("He sighs,", ""),
+    "[cough]": ("He clears his throat,", ""), "[coughs]": ("He coughs,", ""),
+    "[groan]": ("He groans,", '"Ugh,"'), "[groans]": ("He groans,", '"Ugh,"'),
+    "[sniff]": ("He sniffs,", ""), "[sniffs]": ("He sniffs,", ""),
+    "[clear throat]": ("He clears his throat,", ""),
+    "[shush]": ("He shushes,", '"Shh,"'),
+    "[yawn]": ("He yawns,", '"Mmmm,"'), "[yawns]": ("He yawns,", ""),
+    "[hum]": ("He hums softly,", '"Mmmm,"'), "[hums]": ("He hums,", '"Mmmm,"'),
+    "[stutter]": ("He stammers,", '"I... I..."'),
+    "[stammers]": ("He stammers,", '"I... I..."'),
+}
+
+# Активная таблица — выбирается один раз при старте
+EMOTION_TAG_TO_DRAMABOX = (
+    EMOTION_TAG_TO_DRAMABOX_MALE
+    if DRAMABOX_GENDER == "male"
+    else EMOTION_TAG_TO_DRAMABOX_FEMALE
+)
+
 XIAOZHI_EMOTIONS = {
     "neutral": "😶", "happy": "🙂", "laughing": "😆", "funny": "😂",
     "sad": "😔", "angry": "😠", "crying": "😭", "loving": "😍",
@@ -665,7 +766,18 @@ XIAOZHI_EMOTIONS = {
 }
 
 
-def _convert_emotion_tags_for_tts(text: str) -> str:
+def _convert_emotion_tags_for_tts(text: str, engine: str = None) -> str:
+    if engine is None:
+        engine = TTS_ENGINE
+    if engine == "turbo":
+        # Turbo понимает [tag] нативно — нормализуем варианты LLM
+        # и убираем что не понимает Turbo (чтобы не произносилось вслух)
+        def _replace_turbo(m):
+            tag = m.group(0).strip().lower()
+            tag = EMOTION_TAG_NORMALIZE.get(tag, tag)
+            return tag + " " if tag in EMOTION_TAGS_TURBO else " "
+        return re.sub(r"\[[^\]]+\]", _replace_turbo, text).strip()
+    # base/multilingual/edge/openai — конвертация в *tag* формат
     return re.sub(r"\[[^\]]+\]", lambda m: EMOTION_TAG_TO_TTS.get(m.group(0).strip(), " "), text).strip()
 
 
@@ -814,8 +926,10 @@ def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(pcm_bytes)
-        buf.seek(0)
-        return buf.read()
+    # ВАЖНО: seek ПОСЛЕ закрытия wave файла,
+    # иначе data_size в заголовке остаётся 0 и _parse_wav читает 0 фреймов
+    buf.seek(0)
+    return buf.read()
 
 
 def _load_audio_to_numpy(file_bytes: bytes, filename: str = "") -> tuple:
@@ -920,7 +1034,19 @@ def _normalize_wav_to_16k(wav_bytes: bytes) -> bytes:
     pcm_data, sr, n_ch = _parse_wav(wav_bytes)
     if n_ch == 2:
         pcm_data = _stereo_to_mono(pcm_data)
-    if sr != 0 and sr != 16000:
+    if not pcm_data:
+        logger.warning(f"_normalize_wav_to_16k: empty PCM after parse (sr={sr})")
+        return b''
+    if sr == 0:
+        # sr=0 — fallback парсер не смог определить SR.
+        # Без ресэмплинга raw PCM пошёл бы в Opus как 16kHz →
+        # ESP играл бы RVC-выход 40kHz как 16kHz → 2.5x быстрее.
+        # Fallback: считаем что источник уже 16kHz — лучше чем пустить звучит неправильно,
+        # чем играть в 2.5x быстрее
+        logger.warning("_normalize_wav_to_16k: sr=0, WAV заголовок нечитаем, пропускаем без ресэмплинга")
+        return pcm_data
+    if sr != 16000:
+        logger.debug(f"_normalize_wav_to_16k: resampling {sr}Hz → 16000Hz ({len(pcm_data)} bytes)")
         pcm_data = _resample_pcm(pcm_data, sr, 16000)
     return pcm_data
 
@@ -1103,8 +1229,10 @@ async def _run_pipeline(ws, audio_buffer: bytearray, device_id: str,
     logger.info(f"🤖 [{device_id}] Reply: '{full_reply}'")
     memory.add(device_id, "assistant", full_reply)
 
-    # Sentence-by-sentence TTS streaming
-    if TTS_STREAMING:
+    # TTS streaming: chunk (RVCStreamer блоками) / sentence (по предложениям) / batch
+    if _use_chunk_streaming():
+        await _tts_stream_rvc(ws, full_reply, opus_encoder, session_id, device_id)
+    elif TTS_STREAMING:
         await _tts_stream_sentences(ws, full_reply, opus_encoder, session_id, device_id)
     else:
         if TTS_ENGINE == "dramabox":
@@ -1165,6 +1293,157 @@ async def _tts_stream_sentences(ws, full_reply: str, opus_encoder, session_id: s
             logger.error(f"TTS sentence error: {e}")
 
     await rate_ctrl.stop()
+
+
+def _use_chunk_streaming() -> bool:
+    """chunk-режим: локальный TTS-адаптер + включённый RVC + стример доступен."""
+    if TTS_STREAMING_MODE != "chunk" or TTS_ENGINE in ("edge", "openai", "dramabox"):
+        return False
+    tts_cfg = TTS_CONFIG["tts"]
+    if _tts_adapter is None or not tts_cfg.get("rvc_enabled") or not tts_cfg.get("rvc_model_path"):
+        return False
+    try:
+        import rvc_py.realtime  # noqa: F401
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ RVC streaming unavailable, falling back to sentence mode: {e}")
+        return False
+
+
+def _make_rvc_streamer(input_sr: int = 16000):
+    """RVCStreamer на utterance. Модели берутся из кеша rvc_infer._rvc_cache —
+    VRAM не дублируется с батч-путём. Питается PCM 16кГц (TTS-чанк ресэмплится
+    целиком ДО нарезки)."""
+    from rvc_py.realtime import RVCStreamer
+
+    tts_cfg = TTS_CONFIG["tts"]
+    return RVCStreamer(
+        rvc_model_path=tts_cfg["rvc_model_path"],
+        device=tts_cfg.get("device", "cuda"),
+        f0_up_key=tts_cfg.get("rvc_pitch_shift", 0),
+        f0_method=tts_cfg.get("rvc_f0_method", "rmvpe"),
+        index_path=tts_cfg.get("rvc_index_path"),
+        index_rate=tts_cfg.get("rvc_index_rate", 0.5),
+        input_sr=input_sr,
+        output_sr=16000,
+        block_size=max(1, int(16000 * RVC_STREAM_BLOCK_MS / 1000)),
+        overlap=RVC_STREAM_OVERLAP,
+        crossfade=RVC_STREAM_CROSSFADE,
+        vad_threshold_db=RVC_STREAM_VAD_DB,
+        extra_frame=RVC_STREAM_EXTRA_FRAME,
+    )
+
+
+def _resample_f32(audio: np.ndarray, src: int, dst: int) -> np.ndarray:
+    """Ресэмпл float32 gcd-методом — та же математика, что в rvc_py.realtime."""
+    if src == dst:
+        return audio
+    g = math.gcd(src, dst)
+    return scipy_signal.resample_poly(audio, dst // g, src // g).astype(np.float32)
+
+
+def _float_to_pcm16_bytes(audio: np.ndarray) -> bytes:
+    return (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+
+
+async def _warmup_rvc_stream(input_sr: int = 16000):
+    """Прогрев стримера: модели уже в кеше после батч-warmup check_health,
+    здесь прогревается инференс-путь и ловятся ошибки конфига до первого клиента."""
+    streamer = _make_rvc_streamer(input_sr)
+    t = np.arange(input_sr // 10, dtype=np.float32) / float(input_sr)
+    tone = (0.3 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
+    await asyncio.to_thread(streamer.push, tone)
+    await asyncio.to_thread(streamer.flush)
+    streamer.reset()
+
+
+async def _tts_stream_rvc(ws, full_reply: str, opus_encoder, session_id: str, device_id: str):
+    """Chunk-стриминг: TTS-чанки → RVCStreamer.push() → инкрементальная отправка.
+
+    RVC-стадия начинает отдавать звук после накопления первого блока
+    (~RVC_STREAM_BLOCK_MS), не дожидаясь конвертации всего предложения.
+    Блоки конвертируются в asyncio.to_thread — inference синхронный,
+    отправка и paced-плейер продолжают жить в event loop (abort/ping работают).
+    """
+    sentences = _split_by_sentences(full_reply)
+    if not sentences:
+        return
+
+    logger.info(f"🗣️ [{device_id}] Streaming {len(sentences)} sentences (RVC chunk mode)")
+
+    rate_ctrl = AudioRateController()
+    await rate_ctrl.start(ws, opus_encoder)
+    streamer = None
+
+    try:
+        for i, sentence in enumerate(sentences):
+            if TTS_ENGINE == "dramabox":
+                tts_text = _convert_emotion_tags_for_dramabox(sentence)
+            else:
+                tts_text = _convert_emotion_tags_for_tts(sentence)
+            display_text = _clean_emotion_tags(sentence)
+
+            async def _send_sentence_start():
+                if display_text:
+                    await ws.send(json.dumps({
+                        "type": "tts", "state": "sentence_start",
+                        "text": display_text, "session_id": session_id,
+                    }))
+
+            try:
+                sent_start = False
+
+                async for chunk_np, chunk_sr in _tts_adapter.synthesize_stream(tts_text):
+                    # Ресэмпл чанка ЦЕЛИКОМ: resample_poly на мелких кусочках
+                    # даёт щелчки на краях. Стример питается PCM 16кГц.
+                    if chunk_sr != 16000:
+                        chunk_np = await asyncio.to_thread(
+                            _resample_f32, chunk_np, chunk_sr, 16000
+                        )
+                    if streamer is None:
+                        streamer = _make_rvc_streamer()
+                    for off in range(0, len(chunk_np), RVC_STREAM_SLICE):
+                        converted = await asyncio.to_thread(
+                            streamer.push, chunk_np[off:off + RVC_STREAM_SLICE]
+                        )
+                        if converted is not None and len(converted) > 0:
+                            if not sent_start:
+                                await _send_sentence_start()
+                                sent_start = True
+                            await rate_ctrl.enqueue_pcm(_float_to_pcm16_bytes(converted))
+
+                if streamer is not None:
+                    tail = await asyncio.to_thread(streamer.flush)
+                    if tail is not None and len(tail) > 0:
+                        if not sent_start:
+                            await _send_sentence_start()
+                            sent_start = True
+                        await rate_ctrl.enqueue_pcm(_float_to_pcm16_bytes(tail))
+                    streamer.reset()
+                await rate_ctrl.flush_pcm()
+
+                if not sent_start:
+                    await _send_sentence_start()
+
+                logger.info(f"🗣️ [{device_id}] Sentence {i + 1}/{len(sentences)} ({len(tts_text)} chars)")
+
+            except Exception as e:
+                logger.error(f"TTS chunk-stream error (sentence {i + 1}): {e}", exc_info=True)
+                if streamer is not None:
+                    try:
+                        streamer.reset()
+                    except Exception:
+                        pass
+                # Fallback: это предложение батчевым путём, чтобы звук не прерывался
+                try:
+                    pcm_bytes, sr = await run_tts(tts_text)
+                    if pcm_bytes:
+                        await _send_sentence_start()
+                        await rate_ctrl.enqueue(_pcm_to_wav(pcm_bytes, sr))
+                except Exception as e2:
+                    logger.error(f"TTS batch fallback error (sentence {i + 1}): {e2}")
+    finally:
+        await rate_ctrl.stop()
 
 
 async def _try_function_call(text: str, device_id: str) -> Tuple[str, str]:
@@ -1285,6 +1564,14 @@ async def lifespan(app: FastAPI):
     else:
         logger.info(f"✅ TTS engine: {TTS_ENGINE}")
 
+    # Прогрев RVC-стримера (после батч-warmup модели уже в кеше rvc_infer)
+    if _tts_adapter and _use_chunk_streaming():
+        try:
+            await _warmup_rvc_stream()
+            logger.info("✅ RVC streaming warm")
+        except Exception as e:
+            logger.warning(f"⚠️ RVC streaming warmup failed: {e}")
+
     try:
         from ai_service import phoneguy_reply
         _phoneguy_reply = phoneguy_reply
@@ -1295,7 +1582,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"✅ Plugins: {len(tool_registry.tools)} tools registered")
     logger.info(f"✅ Memory: {'enabled' if MEMORY_ENABLED else 'disabled'}")
     logger.info(f"✅ Function calling: {'enabled' if TOOLS_ENABLED else 'disabled'} ({TOOL_CALL_MODE})")
-    logger.info(f"✅ TTS streaming: {'enabled' if TTS_STREAMING else 'disabled'}")
+    logger.info(f"✅ TTS streaming: {TTS_STREAMING_MODE}")
     logger.info(f"✅ Exit commands: {EXIT_COMMANDS}")
     logger.info(f"✅ End prompt: {'enabled' if END_PROMPT_ENABLED else 'disabled'}")
 
@@ -1530,6 +1817,7 @@ async def health():
             "tool_call_mode": TOOL_CALL_MODE,
             "memory_enabled": MEMORY_ENABLED,
             "tts_streaming": TTS_STREAMING,
+            "tts_streaming_mode": TTS_STREAMING_MODE,
             "end_prompt": END_PROMPT_ENABLED,
             "tts_engine": TTS_ENGINE,
         },
@@ -1568,7 +1856,9 @@ async def get_config():
         "VAD_MAX_RECORD_MS": VAD_MAX_RECORD_MS, "VAD_SPEECH_BOOST": VAD_SPEECH_BOOST,
         "TOOLS_ENABLED": TOOLS_ENABLED, "TOOL_CALL_MODE": TOOL_CALL_MODE,
         "MEMORY_ENABLED": MEMORY_ENABLED, "MEMORY_MAX_ENTRIES": MEMORY_MAX_ENTRIES,
-        "TTS_STREAMING": TTS_STREAMING, "END_PROMPT_ENABLED": END_PROMPT_ENABLED,
+        "TTS_STREAMING": TTS_STREAMING_MODE, "END_PROMPT_ENABLED": END_PROMPT_ENABLED,
+        "RVC_STREAM_BLOCK_MS": RVC_STREAM_BLOCK_MS, "RVC_STREAM_OVERLAP": RVC_STREAM_OVERLAP,
+        "RVC_STREAM_CROSSFADE": RVC_STREAM_CROSSFADE, "RVC_STREAM_VAD_DB": RVC_STREAM_VAD_DB,
         "END_PROMPT_TIMEOUT": END_PROMPT_TIMEOUT, "EXIT_COMMANDS": EXIT_COMMANDS,
         "LISTEN_MODE": DEFAULT_LISTEN_MODE, "EDGETTS_VOICE": EDGETTS_VOICE,
         "BRIDGE_TOKEN": BRIDGE_TOKEN[:8] + "...",
@@ -1934,7 +2224,9 @@ async def handle_connection(ws):
 
                     memory.add(device_id, "assistant", full_reply)
 
-                    if TTS_STREAMING:
+                    if _use_chunk_streaming():
+                        await _tts_stream_rvc(ws, full_reply, opus_encoder, session_id, device_id)
+                    elif TTS_STREAMING:
                         await _tts_stream_sentences(ws, full_reply, opus_encoder, session_id, device_id)
                     else:
                         tts_text = _convert_emotion_tags_for_tts(full_reply)
@@ -2066,7 +2358,7 @@ async def main():
     logger.info(f" TTS: {TTS_ENGINE}")
     logger.info(f" Tools: {len(tool_registry.tools)} registered ({TOOL_CALL_MODE})")
     logger.info(f" Memory: {'ON' if MEMORY_ENABLED else 'OFF'}")
-    logger.info(f" Streaming: {'ON' if TTS_STREAMING else 'OFF'}")
+    logger.info(f" Streaming: {TTS_STREAMING_MODE}")
     logger.info(f" Exit cmds: {EXIT_COMMANDS}")
     logger.info(f" Opus: {'available' if OPUS_AVAILABLE else 'NOT installed'}")
     logger.info(f" Timezone: {OTA_TIMEZONE}")

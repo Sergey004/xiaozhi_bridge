@@ -143,7 +143,7 @@ async function fetchHealth(){
       {h:'Devices',v:d.connected_devices||'0',c:'var(--text)',s:'connected'},
       {h:'Tools',v:d.features?.tools_enabled?'ON':'OFF',c:d.features?.tools_enabled?'var(--green)':'var(--dim)',s:`${d.tools_count||0} registered (${feat.tool_call_mode||'off'})`},
       {h:'Memory',v:feat.memory_enabled?'ON':'OFF',c:feat.memory_enabled?'var(--green)':'var(--dim)',s:feat.memory_enabled?'Local short-term':'Disabled'},
-      {h:'Streaming',v:feat.tts_streaming?'ON':'OFF',c:feat.tts_streaming?'var(--green)':'var(--dim)',s:'Sentence-by-sentence TTS'},
+      {h:'Streaming',v:feat.tts_streaming_mode==='chunk'?'CHUNK':(feat.tts_streaming?'ON':'OFF'),c:feat.tts_streaming?'var(--green)':'var(--dim)',s:feat.tts_streaming_mode==='chunk'?'TTS+RVC block streaming':'Sentence-by-sentence TTS'},
       {h:'Features',v:'Active',c:'var(--purple)',s:[
         feat.end_prompt?'End-prompt':'', 
         d.config?.EXIT_COMMANDS?.length?`Exit: ${d.config.EXIT_COMMANDS.join(', ')}`:'',

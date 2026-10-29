@@ -28,3 +28,4 @@ chroma_db/
 knowledge_base/
 xiaozhi-esp32-server
 Xiaozhi-ESP32-Bridge-Server
+.zcode/*
