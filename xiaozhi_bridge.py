@@ -72,9 +72,17 @@ ALLOWED_DEVICES: set = {
     d.strip().lower() for d in _raw_devices.split(",") if d.strip()
 }
 
-# Размер фрейма: 60ms @ 16kHz = 960 сэмплов = 1920 байт PCM16
+# Размер фрейма: 60ms @ 16kHz = 960 сэмплов = 1920 байт PCM16 (аплинк от девайса)
 FRAME_SAMPLES = 960
 FRAME_BYTES   = FRAME_SAMPLES * 2
+
+# Даунлинк (TTS → девайс): полное качество выхода RVC.
+# Opus поддерживает только 8000/12000/16000/24000/48000 — 40k выход RVC
+# нормализуем до 48kHz (совпадает с dmix-слейвом станции — без ресемпла в maind).
+DOWNLINK_SR         = int(os.getenv("DOWNLINK_SR", "48000"))
+DOWNLINK_FRAME_MS   = 60
+DOWNLINK_FRAME_SAMPLES = DOWNLINK_SR * DOWNLINK_FRAME_MS // 1000   # 2880 @ 48k
+DOWNLINK_FRAME_BYTES   = DOWNLINK_FRAME_SAMPLES * 2
 
 # Фразы-заглушки когда LLM недоступен
 LLM_FALLBACK_REPLIES = [
@@ -587,9 +595,9 @@ def _stereo_to_mono(pcm_bytes: bytes) -> bytes:
 
 def _normalize_wav_to_16k(wav_bytes: bytes) -> bytes:
     """
-    Принимает WAV от TTS, нормализует до PCM16 @ 16kHz моно.
-    Chatterbox TTS обычно выдаёт 24000Hz — это ОБЯЗАТЕЛЬНО конвертировать.
-    Returns: PCM16 bytes @ 16kHz mono.
+    Принимает WAV от TTS (обычно 24000Hz Chatterbox / 40000Hz после RVC),
+    нормализует до PCM16 @ DOWNLINK_SR моно для даунлинка девайсу.
+    Returns: PCM16 bytes @ DOWNLINK_SR mono.
     """
     pcm_data, sr, n_ch = _parse_wav(wav_bytes)
 
@@ -597,16 +605,16 @@ def _normalize_wav_to_16k(wav_bytes: bytes) -> bytes:
     if not hasattr(_normalize_wav_to_16k, '_logged_sr'):
         _normalize_wav_to_16k._logged_sr = True
         logger.info(f"🔊 TTS sample rate detected: {sr}Hz, channels={n_ch}")
-        if sr != 16000:
-            logger.info(f"   ⚠️  Resampling {sr}Hz → 16000Hz for device")
+        if sr != DOWNLINK_SR:
+            logger.info(f"   ⚠️  Resampling {sr}Hz → {DOWNLINK_SR}Hz for device")
 
     # Стерео → моно
     if n_ch == 2:
         pcm_data = _stereo_to_mono(pcm_data)
 
-    # Ресемплинг до 16kHz
-    if sr != 0 and sr != 16000:
-        pcm_data = _resample_pcm(pcm_data, sr, 16000)
+    # Ресемплинг до частоты даунлинка (40k RVC → 48k, 24k Chatterbox → 48k)
+    if sr != 0 and sr != DOWNLINK_SR:
+        pcm_data = _resample_pcm(pcm_data, sr, DOWNLINK_SR)
 
     return pcm_data
 
@@ -618,24 +626,24 @@ async def _send_audio(ws, wav_bytes: bytes, opus_encoder=None):
       - Первые 5 пакетов сразу (pre-buffer ~300мс)
       - Остальные — 1 пакет каждые 60мс (AudioRateController)
     """
-    # Нормализация до 16kHz
+    # Нормализация до DOWNLINK_SR (48k для полного качества RVC)
     pcm_data = _normalize_wav_to_16k(wav_bytes)
 
-    # Подготавливаем все фреймы
+    # Подготавливаем все фреймы (60ms @ DOWNLINK_SR)
     frames = []
     if opus_encoder:
-        for i in range(0, len(pcm_data), FRAME_BYTES):
-            chunk = pcm_data[i:i + FRAME_BYTES]
-            if len(chunk) < FRAME_BYTES:
-                chunk = chunk + b'\x00' * (FRAME_BYTES - len(chunk))
+        for i in range(0, len(pcm_data), DOWNLINK_FRAME_BYTES):
+            chunk = pcm_data[i:i + DOWNLINK_FRAME_BYTES]
+            if len(chunk) < DOWNLINK_FRAME_BYTES:
+                chunk = chunk + b'\x00' * (DOWNLINK_FRAME_BYTES - len(chunk))
             try:
-                frames.append(opus_encoder.encode(chunk, FRAME_SAMPLES))
+                frames.append(opus_encoder.encode(chunk, DOWNLINK_FRAME_SAMPLES))
             except Exception as e:
                 logger.error(f"Opus encode error: {e}")
                 break
     else:
-        for i in range(0, len(pcm_data), FRAME_BYTES):
-            chunk = pcm_data[i:i + FRAME_BYTES]
+        for i in range(0, len(pcm_data), DOWNLINK_FRAME_BYTES):
+            chunk = pcm_data[i:i + DOWNLINK_FRAME_BYTES]
             if chunk:
                 frames.append(chunk)
 
@@ -734,9 +742,9 @@ async def handle_hello(ws, data: dict) -> tuple:
         "session_id": secrets.token_hex(16),
         "audio_params": {
             "format": negotiated,
-            "sample_rate": 16000,
+            "sample_rate": DOWNLINK_SR,
             "channels": 1,
-            "frame_duration": 60,
+            "frame_duration": DOWNLINK_FRAME_MS,
         },
         "features": {"vad": True, "mcp": False}
     }
@@ -999,9 +1007,11 @@ async def handle_connection(ws):
 
                 if negotiated_fmt == "opus" and OPUS_AVAILABLE:
                     try:
+                        # Аплинк декодируется на 16к (формат девайса/ASR),
+                        # даунлинк энкодер — на DOWNLINK_SR (полное качество RVC)
                         opus_decoder = opuslib.Decoder(16000, 1)
-                        opus_encoder = opuslib.Encoder(16000, 1, opuslib.APPLICATION_AUDIO)
-                        logger.info(f"📦 [{device_id}] Opus codecs ready")
+                        opus_encoder = opuslib.Encoder(DOWNLINK_SR, 1, opuslib.APPLICATION_AUDIO)
+                        logger.info(f"📦 [{device_id}] Opus codecs ready (uplink 16k, downlink {DOWNLINK_SR})")
                     except Exception as e:
                         logger.error(f"Opus codec error: {e}")
                         negotiated_fmt = "pcm"

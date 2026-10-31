@@ -81,12 +81,64 @@ class ChatterboxAdapter:
         self.rvc_pitch_shift = tts_cfg.get("rvc_pitch_shift", 0)
         self.rvc_index_rate = tts_cfg.get("rvc_index_rate", 0.5)
 
+        # Автовыравнивание высоты голоса: RVC сохраняет f0 входа, а Chatterbox
+        # клонирует референс неточно (замеры: ref 142Hz → выход 230Hz). Считаем
+        # медианную f0 референса и каждой генерации и подаём в rvc_infer точный
+        # полутоновый сдвиг, чтобы выход сидел на регистре целевого голоса.
+        self.auto_pitch_align = tts_cfg.get("rvc_auto_pitch_align", True)
+        self._ref_f0_cache: dict[str, float] = {}
+
         # Отключаем RVC если модуль не импортирован
         if rvc_infer is None:
             self.rvc_enabled = False
             self.logger.warning(
                 "RVC is disabled because rvc_infer module is not available"
             )
+
+    def _median_f0(self, path_or_wav, sr: int | None = None) -> float:
+        """Медианная f0 WAV-файла или float32-массива (librosa.yin, быстрая)."""
+        import librosa
+        import numpy as np
+        if sr is None:
+            y, sr = librosa.load(path_or_wav, sr=None, mono=True, duration=15.0)
+        else:
+            y = np.asarray(path_or_wav, dtype=np.float32).squeeze()
+        if y.ndim > 1:
+            y = y[0]
+        if len(y) < sr // 2:
+            return 0.0
+        f0 = librosa.yin(y, fmin=60, fmax=500, sr=sr, frame_length=1024)
+        f0 = f0[~np.isnan(f0)]
+        if len(f0) < 10:
+            return 0.0
+        return float(np.median(f0))
+
+    def _auto_pitch_shift(self, gen_wav: np.ndarray, gen_sr: int, prompt_path: str | None) -> int:
+        """Полутоновый сдвиг, выравнивающий f0 генерации под f0 референса."""
+        if not self.auto_pitch_align:
+            return 0
+        try:
+            ref_path = prompt_path or self.audio_prompt_path
+            if not ref_path or not ref_path.strip():
+                return 0
+            ref_f0 = self._ref_f0_cache.get(ref_path)
+            if ref_f0 is None:
+                ref_f0 = self._median_f0(ref_path)
+                self._ref_f0_cache[ref_path] = ref_f0
+                if ref_f0 > 0:
+                    self.logger.info(f"[PitchAlign] reference f0={ref_f0:.0f}Hz ({ref_path})")
+            gen_f0 = self._median_f0(gen_wav, gen_sr)
+            if ref_f0 <= 0 or gen_f0 <= 0:
+                return 0
+            shift = round(12.0 * float(np.log2(ref_f0 / gen_f0)))
+            shift = max(-24, min(12, shift))
+            self.logger.info(
+                f"[PitchAlign] gen f0={gen_f0:.0f}Hz -> ref {ref_f0:.0f}Hz, shift={shift:+d} st"
+            )
+            return shift
+        except Exception as e:
+            self.logger.warning(f"[PitchAlign] failed, shift=0: {e}")
+            return 0
 
     def _get_model(self):
         if self._model is not None:
@@ -182,6 +234,10 @@ class ChatterboxAdapter:
                         wave_np = wave_np.reshape(-1)
                     wave_np = wave_np.astype(np.float32, copy=False)
 
+                    # Автовыравнивание: сдвигаем f0 генерации под регистр референса
+                    auto_shift = self._auto_pitch_shift(wave_np, sr, self.audio_prompt_path)
+                    total_shift = int(self.rvc_pitch_shift) + auto_shift
+
                     rvc_result = await asyncio.get_event_loop().run_in_executor(
                         None,
                         lambda: rvc_infer(
@@ -191,7 +247,7 @@ class ChatterboxAdapter:
                             device=self.device,
                             index_path=self.rvc_index_path,
                             index_rate=self.rvc_index_rate,
-                            pitch_shift=self.rvc_pitch_shift,
+                            pitch_shift=total_shift,
                             f0_method=self.rvc_f0_method,
                         ),
                     )
@@ -206,6 +262,17 @@ class ChatterboxAdapter:
 
                 except Exception as e:
                     self.logger.error(f"RVC Error (skipping): {e}", exc_info=True)
+
+            # 2.5 Пик-нормализация как в test_ttc_rvc.py: RVC-выход может
+            # превышать 1.0 — нормализуем до 0.9, чтобы не было клиппинга.
+            if isinstance(wave, np.ndarray):
+                wave_np = np.asarray(wave, dtype=np.float32)
+                if wave_np.ndim > 1:
+                    wave_np = np.squeeze(wave_np)
+                peak = np.abs(wave_np).max() if wave_np.size else 0.0
+                if peak > 0.9:
+                    wave_np = wave_np / peak * 0.9
+                    wave = wave_np
 
             # 3. Конвертация в PCM Int16
             if isinstance(wave, np.ndarray):

@@ -155,7 +155,8 @@ TTS_CONFIG = {
     "tts": {
         "engine": os.getenv("TTS_ENGINE", "turbo"),
         "device": os.getenv("TTS_DEVICE", "cuda"),
-        "audio_prompt_path": os.getenv("TTS_VOICE_SAMPLE"),
+        # .env использует AUDIO_PROMPT_PATH (TTS_VOICE_SAMPLE — старое имя)
+        "audio_prompt_path": os.getenv("TTS_VOICE_SAMPLE") or os.getenv("AUDIO_PROMPT_PATH"),
         "rvc_enabled": os.getenv("RVC_ENABLED", "false").lower() == "true",
         "rvc_model_path": os.getenv("RVC_MODEL_PATH"),
         "rvc_index_path": os.getenv("RVC_INDEX_PATH"),
@@ -170,7 +171,11 @@ VAD_MIN_RECORD_MS = int(os.getenv("VAD_MIN_RECORD_MS", "600"))
 VAD_MAX_RECORD_MS = int(os.getenv("VAD_MAX_RECORD_MS", "10000"))
 VAD_SPEECH_BOOST = float(os.getenv("VAD_SPEECH_BOOST", "1.5"))
 
-FRAME_SAMPLES = 960
+# Даунлинк (TTS → девайс): полное качество выхода RVC.
+# Opus поддерживает только 8000/12000/16000/24000/48000 — 40k выход RVC
+# нормализуем до 48kHz (совпадает с dmix-слейвом станции — без ресемпла в maind).
+DOWNLINK_SR = int(os.getenv("DOWNLINK_SR", "48000"))
+FRAME_SAMPLES = DOWNLINK_SR * 60 // 1000   # 2880 @ 48k
 FRAME_BYTES = FRAME_SAMPLES * 2
 
 LLM_FALLBACK_REPLIES = [
@@ -1039,15 +1044,15 @@ def _normalize_wav_to_16k(wav_bytes: bytes) -> bytes:
         return b''
     if sr == 0:
         # sr=0 — fallback парсер не смог определить SR.
-        # Без ресэмплинга raw PCM пошёл бы в Opus как 16kHz →
-        # ESP играл бы RVC-выход 40kHz как 16kHz → 2.5x быстрее.
-        # Fallback: считаем что источник уже 16kHz — лучше чем пустить звучит неправильно,
-        # чем играть в 2.5x быстрее
-        logger.warning("_normalize_wav_to_16k: sr=0, WAV заголовок нечитаем, пропускаем без ресэмплинга")
+        # Без ресэмплинга raw PCM пошёл бы в Opus как DOWNLINK_SR →
+        # девайс играл бы 24к-источник в 2x быстрее (октава вверх).
+        # Fallback: считаем источник Chatterbox (24000Hz) — и ресэмпл до даунлинка.
+        logger.warning(f"_normalize_wav_to_16k: sr=0, WAV заголовок нечитаем, считаем 24000Hz → {DOWNLINK_SR}Hz")
+        pcm_data = _resample_pcm(pcm_data, 24000, DOWNLINK_SR)
         return pcm_data
-    if sr != 16000:
-        logger.debug(f"_normalize_wav_to_16k: resampling {sr}Hz → 16000Hz ({len(pcm_data)} bytes)")
-        pcm_data = _resample_pcm(pcm_data, sr, 16000)
+    if sr != 0 and sr != DOWNLINK_SR:
+        logger.debug(f"_normalize_wav_to_16k: resampling {sr}Hz → {DOWNLINK_SR}Hz ({len(pcm_data)} bytes)")
+        pcm_data = _resample_pcm(pcm_data, sr, DOWNLINK_SR)
     return pcm_data
 
 
@@ -1325,7 +1330,7 @@ def _make_rvc_streamer(input_sr: int = 16000):
         index_path=tts_cfg.get("rvc_index_path"),
         index_rate=tts_cfg.get("rvc_index_rate", 0.5),
         input_sr=input_sr,
-        output_sr=16000,
+        output_sr=DOWNLINK_SR,
         block_size=max(1, int(16000 * RVC_STREAM_BLOCK_MS / 1000)),
         overlap=RVC_STREAM_OVERLAP,
         crossfade=RVC_STREAM_CROSSFADE,
@@ -1526,7 +1531,7 @@ async def handle_hello(ws, data: dict) -> tuple:
         "session_id": secrets.token_hex(16),
         "audio_params": {
             "format": negotiated,
-            "sample_rate": 16000,
+            "sample_rate": DOWNLINK_SR,
             "channels": 1,
             "frame_duration": 60,
         },
@@ -2161,8 +2166,9 @@ async def handle_connection(ws):
 
                 if negotiated_fmt == "opus" and OPUS_AVAILABLE:
                     try:
+                        # Аплинк — 16к (формат девайса/ASR), даунлинк — DOWNLINK_SR
                         opus_decoder = opuslib.Decoder(16000, 1)
-                        opus_encoder = opuslib.Encoder(16000, 1, opuslib.APPLICATION_AUDIO)
+                        opus_encoder = opuslib.Encoder(DOWNLINK_SR, 1, opuslib.APPLICATION_AUDIO)
                     except Exception as e:
                         logger.error(f"Opus codec error: {e}")
                         negotiated_fmt = "pcm"
