@@ -29,3 +29,8 @@ knowledge_base/
 xiaozhi-esp32-server
 Xiaozhi-ESP32-Bridge-Server
 .zcode/*
+test_tts_*
+test_tts_rvc copy.py
+test_tts_rvc.py
+test_tts_standalone.py
+test_tts_stream.py
