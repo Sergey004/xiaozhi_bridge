@@ -59,8 +59,11 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 # OpenRouter/DeepSeek/vLLM/...: LLM_PROVIDER=openai, LLM_BASE_URL=..., LLM_API_KEY=..., LLM_MODEL=...
 LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("ZAI_API_KEY")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "glm-4.6")
+LLM_MODEL = os.getenv("LLM_MODEL", "glm-4.7-flash")
 ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_FREE_MODEL = "z-ai/glm-4.5-air:free"
 
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.9"))
@@ -73,19 +76,86 @@ memory_processor = None
 current_provider = None
 
 
+def _warm_async(llm_model, warm_text: str = "hi") -> None:
+    """Прогрев LLM в daemon-потоке с таймаутом: не блокирует event loop
+    сервера (синхронный invoke к зависшему провайдеру иначе замораживал
+    весь WS-мост)."""
+    import threading
+
+    def _run():
+        try:
+            llm_model.invoke([HumanMessage(content=warm_text)])
+            logger.info("✅ LLM warm.")
+        except Exception as e:
+            logger.warning(f"⚠️ LLM warm-up failed (will retry on first query): {e}")
+
+    threading.Thread(target=_run, daemon=True, name="llm-warm").start()
+
+
 def _init_llm():
     global llm, AI_ENABLED, current_provider
 
-    if LLM_PROVIDER in ("zai", "zhipu", "openai", "openai_compatible"):
+    # Цепочка провайдеров: основной (LLM_PROVIDER) + fallback через запятую
+    # (LLM_FALLBACK_PROVIDERS, по умолчанию nvidia). Первый успешно
+    # инициализированный и прогретый становится активным.
+    chain = [LLM_PROVIDER]
+    for p in os.getenv("LLM_FALLBACK_PROVIDERS", "nvidia").split(","):
+        p = p.strip().lower()
+        if p and p not in chain:
+            chain.append(p)
+
+    for provider in chain:
+        ok = _init_provider(provider)
+        if ok:
+            return True
+        logger.warning(f"⚠️ Provider '{provider}' failed, trying next...")
+    return False
+
+
+def _init_provider(provider: str) -> bool:
+    global llm, AI_ENABLED, current_provider
+
+    if provider == "openrouter":
+        # Нативная интеграция langchain-openrouter
+        try:
+            from langchain_openrouter import ChatOpenRouter
+
+            api_key = OPENROUTER_API_KEY or LLM_API_KEY
+            model = LLM_MODEL if LLM_MODEL and LLM_MODEL != "glm-4.7-flash" else OPENROUTER_FREE_MODEL
+            if not api_key:
+                logger.error("❌ OPENROUTER_API_KEY not set")
+                return False
+            llm = ChatOpenRouter(
+                model=model,
+                api_key=api_key,
+                temperature=LLM_TEMPERATURE,
+                top_p=LLM_TOP_P,
+                max_tokens=LLM_MAX_TOKENS,
+            )
+            current_provider = provider
+            logger.info(f"✅ OpenRouter LLM initialized: {model}")
+            _warm_async(llm, warm_text="hi")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error initializing OpenRouter LLM: {e}")
+            return False
+
+    if provider in ("zai", "zhipu", "openai", "openai_compatible"):
         try:
             from langchain_openai import ChatOpenAI
 
-            base_url = ZAI_BASE_URL if LLM_PROVIDER in ("zai", "zhipu") else (LLM_BASE_URL or None)
-            if LLM_PROVIDER in ("zai", "zhipu"):
+            base_url = ZAI_BASE_URL if provider in ("zai", "zhipu") else (LLM_BASE_URL or None)
+            if provider in ("zai", "zhipu"):
                 base_url = os.getenv("ZAI_BASE_URL", ZAI_BASE_URL)
             if not LLM_API_KEY:
                 logger.error("❌ LLM_API_KEY/ZAI_API_KEY not set")
                 return False
+            # GLM-модели Z.ai: thinking отключаем (голосовой режим — быстро,
+            # без reasoning-токенов). LLM_THINKING=on включает.
+            extra_body = None
+            thinking_off = os.getenv("LLM_THINKING", "off").lower() in ("off", "false", "0", "disabled")
+            if thinking_off and (provider in ("zai", "zhipu") or "glm" in LLM_MODEL.lower()):
+                extra_body = {"thinking": {"type": "disabled"}}
             llm = ChatOpenAI(
                 model=LLM_MODEL,
                 api_key=LLM_API_KEY,
@@ -93,18 +163,17 @@ def _init_llm():
                 temperature=LLM_TEMPERATURE,
                 top_p=LLM_TOP_P,
                 max_tokens=LLM_MAX_TOKENS,
+                extra_body=extra_body,
             )
-            current_provider = LLM_PROVIDER
+            current_provider = provider
             logger.info(f"✅ OpenAI-compatible LLM initialized: {LLM_MODEL} @ {base_url or 'default'}")
-            logger.info("🔥 Warming up LLM...")
-            llm.invoke([HumanMessage(content="hi")])
-            logger.info("✅ LLM warm.")
+            _warm_async(llm)
             return True
         except Exception as e:
             logger.error(f"❌ Error initializing OpenAI-compatible LLM: {e}")
             return False
 
-    if LLM_PROVIDER == "ollama":
+    if provider == "ollama":
         if ChatOllama is None:
             logger.error(
                 "❌ langchain-ollama not installed. Run: pip install langchain-ollama"
@@ -119,11 +188,9 @@ def _init_llm():
                 top_p=LLM_TOP_P,
                 num_predict=LLM_MAX_TOKENS,
             )
-            current_provider = "ollama"
+            current_provider = provider
             logger.info(f"✅ Ollama initialized: {OLLAMA_MODEL} at {OLLAMA_BASE_URL}")
-            logger.info("🔥 Warming up LLM...")
-            llm.invoke([HumanMessage(content="/no_think hi")])
-            logger.info("✅ LLM warm.")
+            _warm_async(llm, warm_text="/no_think hi")
         except Exception as e:
             logger.error(f"❌ Error initializing Ollama: {e}")
             return False
@@ -138,7 +205,7 @@ def _init_llm():
         try:
             llm = ChatNVIDIA(
                 api_key=NVIDIA_API_KEY,
-                model=os.getenv("NVIDIA_MODEL", "meta/llama3-70b-instruct"),
+                model=os.getenv("NVIDIA_MODEL", "z-ai/glm-5.3-flash"),
                 temperature=LLM_TEMPERATURE,
                 top_p=LLM_TOP_P,
                 max_tokens=LLM_MAX_TOKENS,
@@ -146,11 +213,9 @@ def _init_llm():
                     "extra_body": {"chat_template_kwargs": {"thinking": False}}
                 },
             )
-            current_provider = "nvidia"
+            current_provider = provider
             logger.info("✅ NVIDIA AI initialized")
-            logger.info("🔥 Warming up LLM...")
-            llm.invoke([HumanMessage(content="/no_think hi")])
-            logger.info("✅ LLM warm.")
+            _warm_async(llm, warm_text="/no_think hi")
         except Exception as e:
             logger.error(f"❌ Error initializing NVIDIA AI: {e}")
             return False

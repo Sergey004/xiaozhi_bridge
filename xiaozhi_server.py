@@ -1212,14 +1212,16 @@ async def _run_pipeline(ws, audio_buffer: bytearray, device_id: str,
         # Пустой STT (шум прошёл гейт): вернуть девайс в idle и прослушку,
         # иначе он залипает в Processing с выключенным микрофоном.
         logger.info(f"🔇 [{device_id}] Empty STT, resuming listen")
-        await ws.send(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
+        # Девайс замьючен по listen/stop — возвращаем ему прослушку; он
+        # подтвердит своим listen/start, и сервер возобновит приём кадров.
+        await ws.send(json.dumps({"type": "listen", "state": "start", "session_id": session_id}))
         return
 
     normalized = text.strip().lower().strip(".,!?«»\"'—-")
     if normalized in _WHISPER_HALLUCINATIONS:
         logger.info(f"🔇 [{device_id}] Whisper hallucination filtered: '{text}'")
-        # Вернуть девайс в idle и прослушку (tts/stop -> клиент шлёт listen start)
-        await ws.send(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
+        # Вернуть девайс в прослушку (он подтвердит listen/start)
+        await ws.send(json.dumps({"type": "listen", "state": "start", "session_id": session_id}))
         return
 
     await ws.send(json.dumps({"type": "stt", "text": text, "session_id": session_id}))
