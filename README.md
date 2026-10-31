@@ -1,38 +1,41 @@
-# Xiaozhi Server — голосовой бэкенд для xiaozhi-клиентов
+# Xiaozhi Server — a voice backend for xiaozhi clients
 
-`xiaozhi_server.py` — сервер протокола xiaozhi «всё в одном»:
-**OTA + WebSocket-мост + OpenAI-совместимый STT/TTS/LLM + Dashboard**.
-Заточен под клиента на Яндекс Станции
+[Русский](README_ru.md) | English
+
+`xiaozhi_server.py` is an all-in-one server for the xiaozhi protocol:
+**OTA + WebSocket bridge + OpenAI-compatible STT/TTS/LLM + Dashboard**.
+It is tuned for the client running on a Yandex Station
 ([Sergey004/xiaozhi_yandex_station](https://github.com/Sergey004/xiaozhi_yandex_station)),
-но работает с любым xiaozhi-устройством, включая ESP32.
+but works with any xiaozhi device, including ESP32.
 
-## Возможности
+## Features
 
-- **WebSocket-мост** (`/ws`, Bearer-токен, whitelist устройств по MAC):
-  server-side VAD с автокалибровкой шума, стриминг аудио в обе стороны,
-  пер-девайсный даунлинк (HD-клиенты 48 кГц, ESP32 16 кГц), отмена/abort,
-  ping/pong, контекст диалога и память по device_id.
-- **Голос: Chatterbox TTS → RVC.** Клонирование голоса по референсу
-  (`AUDIO_PROMPT_PATH`), батчевый `rvc_infer` (HuBERT/ContentVec, rmvpe,
-  Faiss-index), **автовыравнивание высоты**: медианная f0 референса и
-  генерации → точный полутоновый сдвиг, чтобы выход всегда сидел в регистре
-  целевого голоса (замерено: 139 Гц при цели 142). Даунлинк нормализуется в
-  `DOWNLINK_SR` (по умолчанию 48 кГц).
-- **STT**: Whisper (`/v1/audio/transcriptions`, `/stt`), язык настраивается.
-- **LLM**: NVIDIA NIM / Ollama (`/v1/chat/completions`), memory по устройству.
-- **OTA** (`/ota`, `/xiaozhi/ota`): активация, конфиг, firmware.
-- **Dashboard + API**: `/` — статус и устройства, `/health`, `/devices`,
+- **WebSocket bridge** (`/ws`, Bearer token, per-MAC device whitelist):
+  server-side VAD with automatic noise calibration, two-way audio
+  streaming, per-device downlink (HD clients 48 kHz, ESP32 16 kHz),
+  abort/cancel, ping/pong, per-device dialogue context and memory.
+- **Voice: Chatterbox TTS → RVC.** Voice cloning from a reference file
+  (`AUDIO_PROMPT_PATH`), batch `rvc_infer` (HuBERT/ContentVec, rmvpe,
+  Faiss index), **automatic pitch alignment**: the median f0 of the
+  reference vs the generated audio → an exact semitone shift, so the
+  output always sits in the target voice's register (measured: 139 Hz
+  against a 142 Hz target). Downlink is normalized to `DOWNLINK_SR`
+  (48 kHz by default).
+- **STT**: Whisper (`/v1/audio/transcriptions`, `/stt`), configurable language.
+- **LLM**: NVIDIA NIM / Ollama (`/v1/chat/completions`), per-device memory.
+- **OTA** (`/ota`, `/xiaozhi/ota`): activation, config, firmware.
+- **Dashboard + API**: `/` — status and devices, `/health`, `/devices`,
   `/logs/stream`, `/tools`, `/memory/{device_id}`.
 
-## Быстрый старт
+## Quick start
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-cp env.example .env          # токены, RVC-модель, референс голоса, LLM
-./start_server.sh            # OTA+API на :8000, WS-мост на :8765
+cp env.example .env          # tokens, RVC model, voice reference, LLM
+./start_server.sh            # OTA+API on :8000, WS bridge on :8765
 ```
 
-Клиент (`xiaozhi_config.json`):
+Client (`xiaozhi_config.json`):
 
 ```json
 { "ws_url": "ws://SERVER:8765/ws",
@@ -40,34 +43,36 @@ cp env.example .env          # токены, RVC-модель, референс 
   "ws_token": "BRIDGE_TOKEN" }
 ```
 
-MAC устройства добавляется в `ALLOWED_DEVICES`; HD-даунлинк включается флагом
-`features.downlink_hd` в hello клиента (ESP32 без флага получают 16 кГц).
+The device MAC goes into `ALLOWED_DEVICES`; HD downlink is enabled by the
+`features.downlink_hd` flag in the client hello (ESP32 devices without the
+flag receive 16 kHz).
 
-## Конфигурация
+## Configuration
 
-Всё через `.env` (шаблон — [env.example](env.example)): движок TTS
-(`turbo|multilingual|dramabox`), пути RVC-модели/index/референса,
-`DOWNLINK_SR`, `TTS_STREAMING` (`off|sentence|chunk` — батч/по предложениям/
-стриминг), VAD-параметры, LLM-провайдер.
+Everything lives in `.env` (template: [env.example](env.example)): the TTS
+engine (`turbo|multilingual|dramabox`), RVC model/index/reference paths,
+`DOWNLINK_SR`, `TTS_STREAMING` (`off|sentence|chunk` — batch / per-sentence
+/ streaming), VAD parameters, the LLM provider.
 
-## Архитектура
+## Architecture
 
 ```
-клиент (WS 8765) ──▶ server-side VAD ──▶ Whisper STT ──▶ LLM ──▶ Chatterbox
-                                                                    │
-клиент ◀── opus 48к/16к paced-отправка ◀── AudioRateController ◀── RVC
+client (WS 8765) ──▶ server-side VAD ──▶ Whisper STT ──▶ LLM ──▶ Chatterbox
+                                                                     │
+client ◀── opus 48k/16k paced send ◀── AudioRateController ◀───── RVC
 ```
 
-Тесты конвертации: `test_tts_rvc.py` (батч, HuBERT vs ContentVec),
-`test_tts_stream.py` (A/B батч против стриминга).
+Conversion tests: `test_tts_rvc.py` (batch, HuBERT vs ContentVec),
+`test_tts_stream.py` (A/B batch vs realtime).
 
-## Статус
+## Status
 
-Рабочий голосовой цикл со Станцией Лайт 2 (vqe_0 → STT → LLM → RVC → динамик).
-Известные ограничения: батчевый RVC добавляет задержку на фразу
-(`TTS_STREAMING=sentence` смягчает); стриминговый путь — другой тембр.
+A working voice loop with a Yandex Station Lite 2 (vqe_0 → STT → LLM → RVC
+→ speaker). Known limitations: batch RVC adds per-phrase latency
+(`TTS_STREAMING=sentence` softens it); the streaming path has a slightly
+different timbre.
 
-## Лицензия
+## License
 
-См. [LICENSE](LICENSE). Модели RVC/референсы — собственность их владельцев,
-использовать только с голосами, на которые у вас есть права.
+See [LICENSE](LICENSE). RVC models and voice references belong to their
+owners — only use voices you have the rights to.
