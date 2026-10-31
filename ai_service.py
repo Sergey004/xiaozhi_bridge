@@ -71,6 +71,7 @@ LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
 
 AI_ENABLED = False
 llm = None
+llm_fallbacks: list = []
 rag_processor = None
 memory_processor = None
 current_provider = None
@@ -92,6 +93,20 @@ def _warm_async(llm_model, warm_text: str = "hi") -> None:
     threading.Thread(target=_run, daemon=True, name="llm-warm").start()
 
 
+def rotate_llm() -> bool:
+    """Переключить активную LLM на следующий фоллбэк (при сбое/лимите).
+    Возвращает True, если остался рабочий фоллбэк."""
+    global llm, llm_fallbacks, current_provider
+    if not llm_fallbacks:
+        return False
+    provider, model = llm_fallbacks.pop(0)
+    llm_fallbacks.append((current_provider, llm))
+    llm = model
+    current_provider = provider
+    logger.warning(f"🔄 LLM switched to fallback: {provider}")
+    return True
+
+
 def _init_llm():
     global llm, AI_ENABLED, current_provider
 
@@ -104,12 +119,24 @@ def _init_llm():
         if p and p not in chain:
             chain.append(p)
 
+    built = []
     for provider in chain:
         ok = _init_provider(provider)
         if ok:
-            return True
-        logger.warning(f"⚠️ Provider '{provider}' failed, trying next...")
-    return False
+            built.append((provider, llm))
+            if len(built) == 1:
+                pass  # primary уже в глобальном llm
+            else:
+                pass
+        logger.warning(f"⚠️ Provider '{provider}' failed, trying next...") if not ok else None
+    if not built:
+        return False
+    # primary = первая модель; остальные — runtime-фоллбэки
+    global llm_fallbacks
+    llm = built[0][1]
+    llm_fallbacks = built[1:]
+    logger.info(f"✅ LLM chain: {[p for p, _ in built]} (active: {built[0][0]})")
+    return True
 
 
 def _init_provider(provider: str) -> bool:

@@ -476,6 +476,8 @@ class AudioRateController:
         self._sending = False
         self._send_task = None
         self._pcm_remainder = b""  # хвост < кадра между enqueue_pcm (стриминг)
+        self._sent_frames = 0
+        self._start_time = None
 
     async def start(self, ws, opus_encoder=None):
         self._ws = ws
@@ -486,10 +488,21 @@ class AudioRateController:
     async def stop(self):
         self._sending = False
         if self._send_task:
+            # Отмена через 2 с резала длинные ответы: paced-отправка длится
+            # столько же, сколько само аудио. Ждём полного дрена очереди.
             try:
-                await asyncio.wait_for(self._send_task, timeout=2.0)
+                await asyncio.wait_for(self._send_task, timeout=120.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
+                logger.error("❌ AudioRate send-task did not drain in 120s")
+        # Даём девайсу доиграть буфер перед tts/stop вызывающего: устройства
+        # (ESP32 и другие) обрывают последние слова фразы без этой паузы.
+        if self._sent_frames > 0:
+            total_ms = self._sent_frames * self.frame_duration_ms
+            elapsed_ms = int((time.monotonic() - self._start_time) * 1000) if self._start_time else 0
+            drain_ms = total_ms - elapsed_ms + 600
+            if drain_ms > 0:
+                logger.info(f"⏳ Device drain: {drain_ms}ms")
+                await asyncio.sleep(drain_ms / 1000)
 
     async def enqueue(self, wav_bytes: bytes):
         """Батч-режим: WAV-байты → normalize → кадры. Хвост дополняется нулями."""
@@ -565,6 +578,8 @@ class AudioRateController:
             sent += 1
         if sent > 0:
             elapsed = time.monotonic() - start_time if start_time else 0
+            self._sent_frames = sent
+            self._start_time = start_time
             logger.info(f"📤 AudioRate: {sent} frames sent in {elapsed:.1f}s")
 
 
