@@ -170,6 +170,16 @@ VAD_SILENCE_FRAMES = int(os.getenv("VAD_SILENCE_FRAMES", "25"))
 VAD_MIN_RECORD_MS = int(os.getenv("VAD_MIN_RECORD_MS", "600"))
 VAD_MAX_RECORD_MS = int(os.getenv("VAD_MAX_RECORD_MS", "10000"))
 VAD_SPEECH_BOOST = float(os.getenv("VAD_SPEECH_BOOST", "1.5"))
+# Энерго-гейт: vqe_0 после шумодава почти цифровая тишина (RMS 1-5, пики <60),
+# VAD может сработать на шорох, а Whisper на тишине галлюцинирует. Буфер без
+# пика речи отбрасывается до STT (пик сырых int16-сэмплов).
+VAD_MIN_PEAK_RAW = int(os.getenv("VAD_MIN_PEAK_RAW", "250"))
+# Известные галлюцинации Whisper на тишине (lowercase, без пунктуации)
+_WHISPER_HALLUCINATIONS = (
+    "продолжение следует", "субтитры делал", "спасибо за просмотр",
+    "пожалуйста подпишитесь на канал", "смотрите также", "till next time",
+    "thanks for watching",
+)
 
 # Даунлинк (TTS → девайс): полное качество выхода RVC.
 # Opus поддерживает только 8000/12000/16000/24000/48000 — 40k выход RVC
@@ -928,6 +938,16 @@ class AdaptiveVAD:
 # UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _buffer_energy(pcm_bytes: bytes) -> tuple[int, float]:
+    """Пик и RMS сырых int16-сэмплов буфера (для энерго-гейта VAD)."""
+    samples = array.array("h", pcm_bytes[: len(pcm_bytes) & ~1])
+    if not samples:
+        return 0, 0.0
+    peak = max(abs(s) for s in samples)
+    rms = math.sqrt(sum(s * s for s in samples) / len(samples))
+    return peak, rms
+
+
 def _pcm_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -1189,6 +1209,17 @@ async def _run_pipeline(ws, audio_buffer: bytearray, device_id: str,
         return
 
     if not text.strip():
+        # Пустой STT (шум прошёл гейт): вернуть девайс в idle и прослушку,
+        # иначе он залипает в Processing с выключенным микрофоном.
+        logger.info(f"🔇 [{device_id}] Empty STT, resuming listen")
+        await ws.send(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
+        return
+
+    normalized = text.strip().lower().strip(".,!?«»\"'—-")
+    if normalized in _WHISPER_HALLUCINATIONS:
+        logger.info(f"🔇 [{device_id}] Whisper hallucination filtered: '{text}'")
+        # Вернуть девайс в idle и прослушку (tts/stop -> клиент шлёт listen start)
+        await ws.send(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
         return
 
     await ws.send(json.dumps({"type": "stt", "text": text, "session_id": session_id}))
@@ -2121,6 +2152,19 @@ async def handle_connection(ws):
                         continue
 
                     logger.info(f"🛑 [{device_id}] End of speech! ({buf_s:.1f}s)")
+
+                    # Энерго-гейт: без настоящей речи в буфере — молча продолжаем
+                    # слушать (девайс не мьютим, пайплайн не запускаем).
+                    gate_peak, gate_rms = _buffer_energy(audio_buffer)
+                    if gate_peak < VAD_MIN_PEAK_RAW:
+                        logger.info(
+                            f"🔇 [{device_id}] Buffer too quiet (peak={gate_peak} rms={gate_rms:.0f} < {VAD_MIN_PEAK_RAW}), ignoring"
+                        )
+                        audio_buffer.clear()
+                        vad.reset()
+                        _frame_count = 0
+                        _vad_log_timer = time.time()
+                        continue
 
                     listening = False
                     processing = True

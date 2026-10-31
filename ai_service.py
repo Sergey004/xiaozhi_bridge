@@ -54,6 +54,14 @@ NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 
+# Универсальные провайдеры: любой OpenAI-совместимый API.
+# Z.ai: LLM_PROVIDER=zai, ZAI_API_KEY=..., LLM_MODEL=glm-4.6
+# OpenRouter/DeepSeek/vLLM/...: LLM_PROVIDER=openai, LLM_BASE_URL=..., LLM_API_KEY=..., LLM_MODEL=...
+LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("ZAI_API_KEY")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "glm-4.6")
+ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
+
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.9"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
@@ -67,6 +75,34 @@ current_provider = None
 
 def _init_llm():
     global llm, AI_ENABLED, current_provider
+
+    if LLM_PROVIDER in ("zai", "zhipu", "openai", "openai_compatible"):
+        try:
+            from langchain_openai import ChatOpenAI
+
+            base_url = ZAI_BASE_URL if LLM_PROVIDER in ("zai", "zhipu") else (LLM_BASE_URL or None)
+            if LLM_PROVIDER in ("zai", "zhipu"):
+                base_url = os.getenv("ZAI_BASE_URL", ZAI_BASE_URL)
+            if not LLM_API_KEY:
+                logger.error("❌ LLM_API_KEY/ZAI_API_KEY not set")
+                return False
+            llm = ChatOpenAI(
+                model=LLM_MODEL,
+                api_key=LLM_API_KEY,
+                base_url=base_url,
+                temperature=LLM_TEMPERATURE,
+                top_p=LLM_TOP_P,
+                max_tokens=LLM_MAX_TOKENS,
+            )
+            current_provider = LLM_PROVIDER
+            logger.info(f"✅ OpenAI-compatible LLM initialized: {LLM_MODEL} @ {base_url or 'default'}")
+            logger.info("🔥 Warming up LLM...")
+            llm.invoke([HumanMessage(content="hi")])
+            logger.info("✅ LLM warm.")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error initializing OpenAI-compatible LLM: {e}")
+            return False
 
     if LLM_PROVIDER == "ollama":
         if ChatOllama is None:
