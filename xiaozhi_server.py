@@ -456,8 +456,12 @@ def _verify_hmac_token(token: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class AudioRateController:
-    def __init__(self, frame_duration_ms: int = 60):
+    def __init__(self, frame_duration_ms: int = 60, downlink_sr: int | None = None):
+        # Per-device downlink rate: 48k для HD-клиентов, 16к для ESP32
+        self.downlink_sr = downlink_sr or DOWNLINK_SR
         self.frame_duration_ms = frame_duration_ms
+        self.frame_samples = self.downlink_sr * self.frame_duration_ms // 1000
+        self.frame_bytes = self.frame_samples * 2
         self._queue: asyncio.Queue = asyncio.Queue()
         self._sending = False
         self._send_task = None
@@ -494,11 +498,11 @@ class AudioRateController:
             return
         tail = self._pcm_remainder
         self._pcm_remainder = b""
-        if len(tail) < FRAME_BYTES:
-            tail = tail + b'\x00' * (FRAME_BYTES - len(tail))
+        if len(tail) < self.frame_bytes:
+            tail = tail + b'\x00' * (self.frame_bytes - len(tail))
         if self._opus_encoder:
             try:
-                await self._queue.put(self._opus_encoder.encode(tail, FRAME_SAMPLES))
+                await self._queue.put(self._opus_encoder.encode(tail, self.frame_samples))
             except Exception:
                 pass
         else:
@@ -508,19 +512,19 @@ class AudioRateController:
         if self._pcm_remainder:
             pcm_data = self._pcm_remainder + pcm_data
             self._pcm_remainder = b""
-        complete = len(pcm_data) - (len(pcm_data) % FRAME_BYTES)
+        complete = len(pcm_data) - (len(pcm_data) % self.frame_bytes)
         if complete <= 0:
             self._pcm_remainder = pcm_data
             return
         frames = []
         if self._opus_encoder:
-            for i in range(0, complete, FRAME_BYTES):
+            for i in range(0, complete, self.frame_bytes):
                 try:
-                    frames.append(self._opus_encoder.encode(pcm_data[i:i + FRAME_BYTES], FRAME_SAMPLES))
+                    frames.append(self._opus_encoder.encode(pcm_data[i:i + self.frame_bytes], self.frame_samples))
                 except Exception:
                     break
         else:
-            for i in range(0, complete, FRAME_BYTES):
+            for i in range(0, complete, self.frame_bytes):
                 frames.append(pcm_data[i:i + FRAME_BYTES])
         self._pcm_remainder = pcm_data[complete:]
         for frame in frames:
@@ -1202,7 +1206,7 @@ async def _run_pipeline(ws, audio_buffer: bytearray, device_id: str,
             pcm_bytes, sr = await run_tts(farewell)
             if pcm_bytes:
                 wav_bytes = _pcm_to_wav(pcm_bytes, sr)
-                rate_ctrl = AudioRateController()
+                rate_ctrl = AudioRateController(downlink_sr=getattr(opus_encoder, "_downlink_sr", 16000))
                 await rate_ctrl.start(ws, opus_encoder)
                 await rate_ctrl.enqueue(wav_bytes)
                 await rate_ctrl.stop()
@@ -1251,7 +1255,7 @@ async def _run_pipeline(ws, audio_buffer: bytearray, device_id: str,
             pcm_bytes, sr = await run_tts(tts_text)
             if pcm_bytes:
                 wav_bytes = _pcm_to_wav(pcm_bytes, sr)
-                rate_ctrl = AudioRateController()
+                rate_ctrl = AudioRateController(downlink_sr=getattr(opus_encoder, "_downlink_sr", 16000))
                 await rate_ctrl.start(ws, opus_encoder)
                 await rate_ctrl.enqueue(wav_bytes)
                 await rate_ctrl.stop()
@@ -1270,7 +1274,7 @@ async def _tts_stream_sentences(ws, full_reply: str, opus_encoder, session_id: s
 
     logger.info(f"🗣️ [{device_id}] Streaming {len(sentences)} sentences")
 
-    rate_ctrl = AudioRateController()
+    rate_ctrl = AudioRateController(downlink_sr=getattr(opus_encoder, "_downlink_sr", 16000))
     await rate_ctrl.start(ws, opus_encoder)
 
     for i, sentence in enumerate(sentences):
@@ -1376,7 +1380,7 @@ async def _tts_stream_rvc(ws, full_reply: str, opus_encoder, session_id: str, de
 
     logger.info(f"🗣️ [{device_id}] Streaming {len(sentences)} sentences (RVC chunk mode)")
 
-    rate_ctrl = AudioRateController()
+    rate_ctrl = AudioRateController(downlink_sr=getattr(opus_encoder, "_downlink_sr", 16000))
     await rate_ctrl.start(ws, opus_encoder)
     streamer = None
 
@@ -1512,7 +1516,7 @@ async def handle_hello(ws, data: dict) -> tuple:
     if device_id != "unknown" and not _check_device(device_id):
         logger.warning(f"❌ Device {device_id} not allowed")
         await ws.send(json.dumps({"type": "hello", "error": "device_not_allowed"}))
-        return False, device_id, "pcm"
+        return False, device_id, "pcm", 16000
 
     device_format = (audio_params.get("format") or "pcm").lower()
     if AUDIO_FORMAT == "auto":
@@ -1524,6 +1528,12 @@ async def handle_hello(ws, data: dict) -> tuple:
         if AUDIO_FORMAT == "opus" and not OPUS_AVAILABLE:
             negotiated = "pcm"
 
+    # Per-device downlink: HD-клиент заявляет features.downlink_hd=true (48к),
+    # ESP32 и прочие без флага получают безопасные 16к.
+    feats = data.get("features") or {}
+    downlink_sr = DOWNLINK_SR if feats.get("downlink_hd") else 16000
+    logger.info(f"🔊 Downlink for {device_id}: {downlink_sr}Hz (hd={bool(feats.get('downlink_hd'))})")
+
     response = {
         "type": "hello",
         "version": 1,
@@ -1531,14 +1541,14 @@ async def handle_hello(ws, data: dict) -> tuple:
         "session_id": secrets.token_hex(16),
         "audio_params": {
             "format": negotiated,
-            "sample_rate": DOWNLINK_SR,
+            "sample_rate": downlink_sr,
             "channels": 1,
             "frame_duration": 60,
         },
     }
     await ws.send(json.dumps(response))
     logger.info(f"✅ Hello OK: {device_id} | format={negotiated}")
-    return True, device_id, negotiated
+    return True, device_id, negotiated, downlink_sr
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2153,7 +2163,7 @@ async def handle_connection(ws):
 
             # Hello
             if msg_type == "hello":
-                ok, device_id, negotiated_fmt = await handle_hello(ws, data)
+                ok, device_id, negotiated_fmt, downlink_sr = await handle_hello(ws, data)
                 if not ok:
                     await ws.close(1008, "Device not allowed")
                     return
@@ -2166,9 +2176,10 @@ async def handle_connection(ws):
 
                 if negotiated_fmt == "opus" and OPUS_AVAILABLE:
                     try:
-                        # Аплинк — 16к (формат девайса/ASR), даунлинк — DOWNLINK_SR
+                        # Аплинк — 16к (формат девайса/ASR), даунлинк — per-device
                         opus_decoder = opuslib.Decoder(16000, 1)
-                        opus_encoder = opuslib.Encoder(DOWNLINK_SR, 1, opuslib.APPLICATION_AUDIO)
+                        opus_encoder = opuslib.Encoder(downlink_sr, 1, opuslib.APPLICATION_AUDIO)
+                        opus_encoder._downlink_sr = downlink_sr
                     except Exception as e:
                         logger.error(f"Opus codec error: {e}")
                         negotiated_fmt = "pcm"
@@ -2242,7 +2253,7 @@ async def handle_connection(ws):
                         try:
                             pcm_bytes, sr = await run_tts(tts_text)
                             if pcm_bytes:
-                                rate_ctrl = AudioRateController()
+                                rate_ctrl = AudioRateController(downlink_sr=getattr(opus_encoder, "_downlink_sr", 16000))
                                 await rate_ctrl.start(ws, opus_encoder)
                                 await rate_ctrl.enqueue(_pcm_to_wav(pcm_bytes, sr))
                                 await rate_ctrl.stop()
@@ -2318,7 +2329,7 @@ async def handle_connection(ws):
                     await ws.send(json.dumps({"type": "tts", "state": "sentence_start", "text": END_PROMPT_TEXT, "session_id": session_id}))
                     pcm_bytes, sr = await run_tts(END_PROMPT_TEXT)
                     if pcm_bytes:
-                        rate_ctrl = AudioRateController()
+                        rate_ctrl = AudioRateController(downlink_sr=getattr(opus_encoder, "_downlink_sr", 16000))
                         await rate_ctrl.start(ws, opus_encoder)
                         await rate_ctrl.enqueue(_pcm_to_wav(pcm_bytes, sr))
                         await rate_ctrl.stop()
