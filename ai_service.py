@@ -575,76 +575,38 @@ def reset_conversation_history():
 
 def switch_llm_provider(provider: str) -> bool:
     """
-    Переключает LLM провайдера между 'nvidia' и 'ollama'.
+    Переключает LLM провайдера на любой поддерживаемый _init_provider()
+    (nvidia / ollama / zai / openrouter / openai_compatible).
     Сбрасывает историю разговора при переключении.
 
     Args:
-        provider: 'nvidia' или 'ollama'
+        provider: имя провайдера (см. _init_provider)
 
     Returns:
         True если переключение успешно, False иначе
     """
     global llm, current_provider
 
-    provider = provider.lower()
-    if provider not in ("nvidia", "ollama"):
-        logger.error(f"❌ Unknown provider: {provider}. Use 'nvidia' or 'ollama'")
-        return False
-
+    provider = provider.strip().lower()
     if provider == current_provider:
         logger.info(f"ℹ️ Already using {provider}")
         return True
 
     logger.info(f"🔄 Switching LLM provider to {provider}...")
 
+    prev_llm, prev_provider = llm, current_provider
     conversation_history.clear()
     current_provider = None
     llm = None
 
-    if provider == "ollama":
-        if ChatOllama is None:
-            logger.error(
-                "❌ langchain-ollama not installed. Run: pip install langchain-ollama"
-            )
-            return False
-        try:
-            llm = ChatOllama(
-                base_url=OLLAMA_BASE_URL,
-                model=OLLAMA_MODEL,
-                temperature=LLM_TEMPERATURE,
-                top_p=LLM_TOP_P,
-                num_predict=LLM_MAX_TOKENS,
-            )
-            current_provider = "ollama"
-            logger.info(f"✅ Switched to Ollama: {OLLAMA_MODEL}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to switch to Ollama: {e}")
-            return False
+    if _init_provider(provider):
+        logger.info(f"✅ Switched to {provider}: {get_llm_provider()}")
+        return True
 
-    else:
-        if not NVIDIA_API_KEY or ChatNVIDIA is None:
-            logger.error(
-                "❌ NVIDIA API key not set or langchain-nvidia-ai-endpoints not installed"
-            )
-            return False
-        try:
-            llm = ChatNVIDIA(
-                api_key=NVIDIA_API_KEY,
-                model=os.getenv("NVIDIA_MODEL", "meta/llama3-70b-instruct"),
-                temperature=LLM_TEMPERATURE,
-                top_p=LLM_TOP_P,
-                max_tokens=LLM_MAX_TOKENS,
-                model_kwargs={
-                    "extra_body": {"chat_template_kwargs": {"thinking": True}}
-                },
-            )
-            current_provider = "nvidia"
-            logger.info("✅ Switched to NVIDIA")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to switch to NVIDIA: {e}")
-            return False
+    # Откат на предыдущего провайдера, чтобы не остаться без LLM.
+    logger.error(f"❌ Failed to switch to {provider}, restoring {prev_provider}")
+    llm, current_provider = prev_llm, prev_provider
+    return False
 
 
 def get_llm_provider() -> str:

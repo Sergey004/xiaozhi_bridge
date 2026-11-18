@@ -48,6 +48,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from scipy import signal as scipy_signal
 
+# Module-level: make switch_llm_provider available for /tools etc.
+try:
+    from ai_service import switch_llm_provider
+except Exception:
+    switch_llm_provider = None
+
 import dotenv
 dotenv.load_dotenv()
 
@@ -70,7 +76,7 @@ MY_HOST = os.getenv("MY_HOST", "192.168.1.100")
 HTTP_PORT = int(os.getenv("HTTP_PORT", "8000"))
 BRIDGE_HOST = os.getenv("BRIDGE_HOST", "0.0.0.0")
 BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "8765"))
-OTA_VERSION = os.getenv("OTA_VERSION", "1.0.0")
+OTA_VERSION = os.getenv("OTA_VERSION", "1.215")
 OTA_FIRMWARE = os.getenv("OTA_FIRMWARE_URL", "")
 OTA_TIMEZONE = os.getenv("OTA_TIMEZONE", "Europe/Samara")
 
@@ -94,7 +100,7 @@ EXIT_COMMANDS = [c.strip().lower() for c in os.getenv("EXIT_COMMANDS", "выхо
 
 # End-of-conversation
 END_PROMPT_ENABLED = os.getenv("END_PROMPT_ENABLED", "true").lower() == "true"
-END_PROMPT_TEXT = os.getenv("END_PROMPT_TEXT", "До свидания! Хорошего дня!")
+END_PROMPT_TEXT = os.getenv("END_PROMPT_TEXT", "See you later, superstar! Take care!")
 END_PROMPT_TIMEOUT = int(os.getenv("END_PROMPT_TIMEOUT", "30"))
 
 # Memory
@@ -188,10 +194,21 @@ DOWNLINK_SR = int(os.getenv("DOWNLINK_SR", "48000"))
 FRAME_SAMPLES = DOWNLINK_SR * 60 // 1000   # 2880 @ 48k
 FRAME_BYTES = FRAME_SAMPLES * 2
 
+# ── Музыка (tool play_music) ──
+# off — tool отвечает, что музыка выключена; url — прямые ссылки http(s)
+# или локальные файлы; ytdlp — поиск/резолв через yt-dlp.
+MUSIC_MODE = os.getenv("MUSIC_MODE", "off").strip().lower()
+# Предохранитель: сколько секунд музыки максимум стримить за раз.
+MUSIC_MAX_SECONDS = int(os.getenv("MUSIC_MAX_SECONDS", "600"))
+
+# ── Напоминания (tool set_reminder) ──
+REMINDER_CHECK_SEC = int(os.getenv("REMINDER_CHECK_SEC", "30"))
+REMINDERS_FILE = os.getenv("REMINDERS_FILE", "data/reminders.json")
+
 LLM_FALLBACK_REPLIES = [
-    "У меня сейчас проблемы со связью. Попробуй позже.",
-    "Сигнал пропал. Перезвони, пожалуйста.",
-    "Кажется, мой мозг завис. Подожди немного.",
+    "My connection is acting up right now. Try again in a bit, superstar.",
+    "Signal dropped for a second. Call me again, okay?",
+    "My brain glitched out for a moment. Give me a moment, superstar.",
 ]
 
 # System prompt template (Jinja2)
@@ -220,6 +237,20 @@ _phoneguy_reply = None
 
 _activation_codes: dict = {}
 _activated_devices: set = set()
+
+# Музыка: device_id → источник (URL/путь), отложенный до конца TTS-ответа.
+# Заполняет tool play_music, потребляет _run_pipeline.
+_pending_music: dict = {}
+
+# Живые WS-соединения: device_id → websocket (для push-доставки напоминаний).
+_connections: dict = {}
+
+
+def _set_busy(device_id: str, busy: bool) -> None:
+    """Флаг «устройство в пайплайне/TTS» — планировщик напоминаний ждёт."""
+    info = _devices.get(device_id)
+    if info is not None:
+        info["busy"] = busy
 
 # Dashboard state
 _devices: dict = {}
@@ -584,6 +615,134 @@ class AudioRateController:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# REMINDERS STORE (tool set_reminder)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _load_reminders() -> dict:
+    try:
+        with open(REMINDERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_reminders(store: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(REMINDERS_FILE) or ".", exist_ok=True)
+        tmp = REMINDERS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, REMINDERS_FILE)
+    except Exception as e:
+        logger.error(f"⏰ Reminders save failed: {e}")
+
+
+def _reminder_add(device_id: str, text: str, minutes: float) -> dict:
+    store = _load_reminders()
+    reminder = {
+        "id": secrets.token_hex(4),
+        "text": text[:300],
+        "created_ts": time.time(),
+        "due_ts": time.time() + minutes * 60,
+    }
+    store.setdefault(device_id, []).append(reminder)
+    _save_reminders(store)
+    return reminder
+
+
+def _reminder_pop_due(device_id: str) -> list:
+    """Забрать все наступившие напоминания устройства (и удалить из файла)."""
+    store = _load_reminders()
+    items = store.get(device_id, [])
+    now = time.time()
+    due = [r for r in items if r.get("due_ts", 0) <= now]
+    if due:
+        store[device_id] = [r for r in items if r.get("due_ts", 0) > now]
+        _save_reminders(store)
+    return due
+
+
+def _reminder_cancel_all(device_id: str) -> int:
+    store = _load_reminders()
+    n = len(store.get(device_id, []))
+    if n:
+        store.pop(device_id, None)
+        _save_reminders(store)
+    return n
+
+
+def _fmt_due(due_ts: float) -> str:
+    try:
+        import datetime, zoneinfo
+        tz = zoneinfo.ZoneInfo(OTA_TIMEZONE)
+        dt = datetime.datetime.fromtimestamp(due_ts, tz)
+    except Exception:
+        dt = datetime.datetime.fromtimestamp(due_ts)
+    return dt.strftime("%H:%M")
+
+
+async def _deliver_reminder(ws, opus_encoder, device_id: str, reminder: dict) -> bool:
+    """TTS-push напоминания в живое соединение. False — устройство занято."""
+    session_id = secrets.token_hex(16)
+    text = f"Напоминание: {reminder['text']}"
+    try:
+        await ws.send(json.dumps({"type": "tts", "state": "start", "session_id": session_id}))
+        await ws.send(json.dumps({"type": "tts", "state": "sentence_start", "text": text, "session_id": session_id}))
+        pcm_bytes, sr = await run_tts(text)
+        if pcm_bytes:
+            rate_ctrl = AudioRateController(downlink_sr=getattr(opus_encoder, "_downlink_sr", 16000))
+            await rate_ctrl.start(ws, opus_encoder)
+            await rate_ctrl.enqueue(_pcm_to_wav(pcm_bytes, sr))
+            await rate_ctrl.stop()
+        await ws.send(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
+        memory.add(device_id, "assistant", text)
+        return True
+    except Exception as e:
+        logger.warning(f"⏰ [{device_id}] Reminder delivery failed: {e}")
+        return False
+
+
+async def reminder_scheduler():
+    """Раз в REMINDER_CHECK_SEC: доставить наступившие напоминания устройствам
+    в сети (если соединение свободно — не в Processing/Speaking). Офлайн- и
+    занятые — остаются в файле до следующего тика/переподключения."""
+    logger.info(f"⏰ Reminder scheduler: every {REMINDER_CHECK_SEC}s → {REMINDERS_FILE}")
+    while True:
+        await asyncio.sleep(REMINDER_CHECK_SEC)
+        try:
+            store = _load_reminders()
+            for device_id in list(store.keys()):
+                ws = _connections.get(device_id)
+                if ws is None:
+                    continue  # офлайн: доставим после hello
+                info = _devices.get(device_id, {})
+                if info.get("busy"):
+                    continue  # занят TTS/pipeline — повторим на следующем тике
+                due = _reminder_pop_due(device_id)
+                for reminder in due:
+                    ok = await _deliver_reminder(ws, device_id, reminder)
+                    if not ok:
+                        # вернуть, попробуем позже
+                        store = _load_reminders()
+                        store.setdefault(device_id, []).insert(0, reminder)
+                        _save_reminders(store)
+                        break
+        except Exception as e:
+            logger.error(f"⏰ Scheduler error: {e}")
+
+
+async def _deliver_pending_reminders_on_hello(ws, device_id: str) -> None:
+    """После hello: отдать все просроченные напоминания офлайн-устройства."""
+    try:
+        due = _reminder_pop_due(device_id)
+        for reminder in due:
+            await _deliver_reminder(ws, device_id, reminder)
+            await asyncio.sleep(0.3)
+    except Exception as e:
+        logger.warning(f"⏰ [{device_id}] Hello delivery failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TOOL IMPLEMENTATIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -671,11 +830,12 @@ async def _tool_web_search(args: dict, device_id: str = "") -> str:
 
 @tool_registry.register(
     name="play_music",
-    description="Play music (tells device to play music)",
+    description="Play music on the speaker. Starts after your spoken reply. "
+                "Requires MUSIC_MODE=url (direct links/files) or ytdlp (search by name).",
     parameters={
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Song or artist name"},
+            "query": {"type": "string", "description": "Song/artist name or direct audio URL"},
         },
         "required": ["query"],
     },
@@ -683,25 +843,87 @@ async def _tool_web_search(args: dict, device_id: str = "") -> str:
 )
 async def _tool_play_music(args: dict, device_id: str = "") -> Tuple[ActionResponse, str]:
     query = args.get("query", "")
-    return ActionResponse.RESPONSE, f"Включаю музыку: {query}"
+    if MUSIC_MODE not in ("url", "ytdlp"):
+        return ActionResponse.RESPONSE, (
+            "Музыка выключена на сервере (MUSIC_MODE=off). Скажи об этом пользователю."
+        )
+    try:
+        source, title = await asyncio.to_thread(_resolve_music, query)
+    except Exception as e:
+        logger.warning(f"🎵 [{device_id}] Music resolve failed: {e}")
+        return ActionResponse.RESPONSE, f"Не удалось найти музыку '{query}': {e}"
+    _pending_music[device_id] = (source, title)
+    logger.info(f"🎵 [{device_id}] Music queued: {title}")
+    return ActionResponse.RESPONSE, f"Включаю музыку: {title}. Коротко подтверди и закончи фразу."
 
 
 @tool_registry.register(
     name="set_reminder",
-    description="Set a reminder for a specific time",
+    description="Set a reminder. The assistant will say the message after the given "
+                "number of minutes (device must be reachable; offline reminders are "
+                "delivered on next connection).",
     parameters={
         "type": "object",
         "properties": {
-            "time": {"type": "string", "description": "Time in HH:MM format"},
-            "message": {"type": "string", "description": "Reminder message"},
+            "message": {"type": "string", "description": "Reminder text to say"},
+            "minutes": {"type": "number", "description": "Delay in minutes from now"},
         },
-        "required": ["time", "message"],
+        "required": ["message", "minutes"],
     },
 )
 async def _tool_reminder(args: dict, device_id: str = "") -> str:
-    t = args.get("time", "??:??")
-    msg = args.get("message", "")
-    return f"Напоминание установлено на {t}: {msg}"
+    msg = (args.get("message") or "").strip()
+    try:
+        minutes = float(args.get("minutes", 0))
+    except (TypeError, ValueError):
+        minutes = 0.0
+    if not msg or minutes <= 0:
+        return "Не удалось поставить напоминание: нужны текст и положительное число минут."
+    reminder = _reminder_add(device_id, msg, minutes)
+    human = _fmt_due(reminder["due_ts"])
+    logger.info(f"⏰ [{device_id}] Reminder set: '{msg}' at {human}")
+    return f"Напоминание поставлено на {human}: {msg}"
+
+
+@tool_registry.register(
+    name="clock_show",
+    description="Show up to 4 characters on the speaker's 7-segment clock display "
+                "(digits, latin letters without K M Q V W X Z, - _ ° and colon). "
+                "The stock clock returns by itself after the given seconds.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "e.g. 12:30, HI, 25, -5°"},
+            "seconds": {"type": "integer", "minimum": 1, "maximum": 60,
+                        "description": "How long to keep the text on the display"},
+            "align": {"type": "string", "enum": ["left", "right"]},
+            "brightness": {"type": "integer", "minimum": 1, "maximum": 255},
+        },
+        "required": ["text"],
+    },
+)
+async def _tool_clock_show(args: dict, device_id: str = "") -> str:
+    text = (args.get("text") or "").strip()
+    seconds = int(args.get("seconds", 5))
+    seconds = max(1, min(60, seconds))
+    brightness = int(args.get("brightness", 120))
+    brightness = max(1, min(255, brightness))
+    align = args.get("align", "left")
+    if align not in ("left", "right"):
+        align = "left"
+    conn = _connections.get(device_id)
+    if conn is None:
+        return "Устройство не в сети, дисплей недоступен."
+    try:
+        await conn["ws"].send(json.dumps({
+            "type": "clock", "text": text,
+            "seconds": seconds, "align": align, "brightness": brightness,
+        }))
+    except Exception as e:
+        logger.warning(f" clocks [{device_id}] send failed: {e}")
+        return "Не удалось отправить текст на дисплей."
+    logger.info(f" clocks [{device_id}] show '{text}' for {seconds}s")
+    return f"Показано «{text}» на {seconds} с"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1096,6 +1318,107 @@ def _normalize_wav_to_16k(wav_bytes: bytes) -> bytes:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# MUSIC (tool play_music)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _resolve_music(query: str) -> Tuple[str, str]:
+    """Резолв запроса в (источник, название). Источник — http(s) URL или
+    локальный путь. MUSIC_MODE: url — только прямые ссылки/файлы,
+    ytdlp — поиск через yt-dlp (bestaudio)."""
+    query = (query or "").strip()
+    if not query:
+        raise ValueError("empty query")
+
+    # Прямая ссылка или локальный файл — работает в любом режиме.
+    if query.lower().startswith(("http://", "https://")):
+        return query, query.rsplit("/", 1)[-1] or "audio"
+    if MUSIC_MODE != "ytdlp" and os.path.isfile(query):
+        return query, os.path.basename(query)
+
+    if MUSIC_MODE == "ytdlp":
+        import yt_dlp
+        opts = {
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "default_search": "ytsearch1",
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+        entry = info["entries"][0] if "entries" in info else info
+        url = entry.get("url") or entry.get("webpage_url")
+        title = entry.get("title") or "audio"
+        if not url:
+            raise ValueError("yt-dlp: no audio url")
+        # Некоторые экстракторы отдают m3u8 — ffmpeg играет их напрямую.
+        return url, title
+
+    raise ValueError(
+        f"music disabled (MUSIC_MODE={MUSIC_MODE}); use a direct http(s) URL "
+        f"or set MUSIC_MODE=url|ytdlp"
+    )
+
+
+async def _play_music_stream(ws, source: str, opus_encoder, session_id: str,
+                             title: str = ""):
+    """Стрим музыки в устройство: ffmpeg → s16le/mono/@downlink_sr →
+    AudioRateController (paced opus) → tts start/stop вокруг потока.
+
+    Вызывается из _run_pipeline (pipeline_task) — отменяется серверным
+    abort так же, как TTS. RVC не участвует: путь прямой в даунлинк-SR
+    конкретного устройства."""
+    downlink_sr = getattr(opus_encoder, "_downlink_sr", 16000) or DOWNLINK_SR
+    logger.info(f"🎵 [{session_id}] Music stream: {title or source} @ {downlink_sr}Hz")
+
+    await ws.send(json.dumps({"type": "tts", "state": "start", "session_id": session_id}))
+    if title:
+        await ws.send(json.dumps({
+            "type": "tts", "state": "sentence_start",
+            "text": f"🎵 {title}", "session_id": session_id,
+        }))
+
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-re",  # реальное время: не заливаем очередь на часы вперёд
+        "-i", source,
+        "-t", str(MUSIC_MAX_SECONDS),
+        "-f", "s16le", "-ac", "1", "-ar", str(downlink_sr),
+        "pipe:1",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+    rate_ctrl = AudioRateController(downlink_sr=downlink_sr)
+    await rate_ctrl.start(ws, opus_encoder)
+    chunk_bytes = downlink_sr * 2  # 1 секунда PCM за чтение
+    sent_seconds = 0
+    try:
+        while True:
+            chunk = await proc.stdout.read(chunk_bytes)
+            if not chunk:
+                break
+            await rate_ctrl.enqueue_pcm(chunk)
+            sent_seconds += len(chunk) / (downlink_sr * 2)
+        await rate_ctrl.flush_pcm()
+    finally:
+        # abort отменяет и этот код: убиваем ffmpeg, чтобы не висел.
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        await rate_ctrl.stop()
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+    await ws.send(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
+    logger.info(f"🎵 [{session_id}] Music done ({sent_seconds:.0f}s)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # TTS ENGINES
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1201,6 +1524,8 @@ async def _process_audio_pipeline(ws, audio_buffer: bytearray, device_id: str,
         await _run_pipeline(ws, audio_buffer, device_id, opus_encoder, is_aborted, session_id, listen_mode)
     except asyncio.CancelledError:
         logger.info(f"⏹️ [{device_id}] Pipeline canceled")
+        # Отложенная музыка не должна сыграться на следующей фразе.
+        _pending_music.pop(device_id, None)
         # Send tts/stop so device exits Speaking state
         try:
             await ws.send(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
@@ -1309,6 +1634,19 @@ async def _run_pipeline(ws, audio_buffer: bytearray, device_id: str,
                 await rate_ctrl.stop()
         except Exception as e:
             logger.error(f"TTS error: {e}")
+
+    # Отложенная музыка от play_music: после реплики, до tts/stop (девайс
+    # остаётся в Speaking, микрофон замьючен). abort отменяет вместе с пайплайном.
+    music = _pending_music.pop(device_id, None)
+    if music is not None:
+        source, title = music
+        try:
+            await _play_music_stream(ws, source, opus_encoder, session_id, title)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"🎵 [{device_id}] Music stream error: {e}")
+            await ws.send(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
 
     await ws.send(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
     logger.info(f"✅ [{device_id}] Response complete")
@@ -1618,10 +1956,11 @@ async def lifespan(app: FastAPI):
     # TTS: skip loading adapter if using edge or openai engine
     if TTS_ENGINE not in ("edge", "openai"):
         try:
-            from tts_adapter import ChatterboxAdapter as TTSAdapter
-            _tts_adapter = TTSAdapter(TTS_CONFIG, logger)
+            # Фабрика выбирает движок по TTS_ENGINE (turbo/base/multilingual/dramabox)
+            from tts_adapter import create_tts_adapter
+            _tts_adapter = create_tts_adapter(TTS_CONFIG, logger)
             ok = await _tts_adapter.check_health()
-            logger.info("✅ TTS (Chatterbox) ready" if ok else "⚠️ TTS health warn")
+            logger.info(f"✅ TTS ({TTS_ENGINE}) ready" if ok else "⚠️ TTS health warn")
         except Exception as e:
             logger.error(f"❌ TTS: {e}")
     else:
@@ -1717,7 +2056,9 @@ async def ota_activate(request: Request):
     logger.info(f"📡 Activate: device={device_id}")
     ws = _ws_url()
     _activated_devices.add(device_id)
-    return {"success": True, "websocket": {"url": ws, "token": BRIDGE_TOKEN}}
+    # Выдаём персональный HMAC-токен (как /ota), а не общий BRIDGE_TOKEN.
+    token = _generate_hmac_token(device_id) if HMAC_SECRET != BRIDGE_TOKEN else BRIDGE_TOKEN
+    return {"success": True, "websocket": {"url": ws, "token": token}}
 
 
 @app.post("/ota/upload")
@@ -2087,10 +2428,49 @@ async def handle_connection(ws):
     _vad_log_timer = time.time()
     _last_voice_time = time.time()
     _end_prompt_sent = False
+    # Прощание (END_PROMPT) — только если на соединении был реальный диалог
+    # (STT-пайплайн). Иначе idle-таумат не орёт с колонки при молчащем клиенте.
+    had_conversation = False
     pipeline_task = None
 
     try:
-        async for message in ws:
+        while True:
+            # ── Idle-таймаут (END_PROMPT): только после hello и вне пайплайна/TTS
+            # (долгая музыка/реплика не должна считаться простоем). Любое
+            # сообщение сбрасывает таймер (_last_voice_time обновляется ниже).
+            if (hello_done and END_PROMPT_ENABLED and not _end_prompt_sent
+                    and not tts_active and not processing and pipeline_task is None):
+                idle_left = END_PROMPT_TIMEOUT - (time.time() - _last_voice_time)
+                recv_timeout = max(1.0, idle_left)
+            else:
+                recv_timeout = None
+            try:
+                if recv_timeout is None:
+                    message = await ws.recv()
+                else:
+                    message = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
+            except asyncio.TimeoutError:
+                if not had_conversation:
+                    # Диалога не было: молча перезаводим таймер (никакого
+                    # спонтанного звука из колонки).
+                    _last_voice_time = time.time()
+                    continue
+                idle_time = time.time() - _last_voice_time
+                _end_prompt_sent = True
+                logger.info(f"👋 [{device_id}] End-of-conversation prompt (idle {idle_time:.0f}s)")
+                try:
+                    await ws.send(json.dumps({"type": "tts", "state": "start", "session_id": session_id}))
+                    await ws.send(json.dumps({"type": "tts", "state": "sentence_start", "text": END_PROMPT_TEXT, "session_id": session_id}))
+                    pcm_bytes, sr = await run_tts(END_PROMPT_TEXT)
+                    if pcm_bytes:
+                        rate_ctrl = AudioRateController(downlink_sr=getattr(opus_encoder, "_downlink_sr", 16000))
+                        await rate_ctrl.start(ws, opus_encoder)
+                        await rate_ctrl.enqueue(_pcm_to_wav(pcm_bytes, sr))
+                        await rate_ctrl.stop()
+                    await ws.send(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
+                except Exception:
+                    pass
+                break
 
             # ── Check if background pipeline completed ──
             if pipeline_task and pipeline_task.done():
@@ -2101,6 +2481,7 @@ async def handle_connection(ws):
                 pipeline_task = None
                 processing = False
                 tts_active = False
+                _set_busy(device_id, False)
                 vad.reset()
                 _frame_count = 0
                 _vad_log_timer = time.time()
@@ -2186,6 +2567,8 @@ async def handle_connection(ws):
                     listening = False
                     processing = True
                     tts_active = True
+                    _set_busy(device_id, True)
+                    had_conversation = True
 
                     await ws.send(json.dumps({"type": "listen", "state": "stop", "session_id": session_id}))
 
@@ -2232,6 +2615,7 @@ async def handle_connection(ws):
                 _devices[device_id] = {
                     "client_id": client_id, "connected": True,
                     "last_seen": time.time(), "format": negotiated_fmt,
+                    "busy": False,
                 }
                 memory.load(device_id)
 
@@ -2244,6 +2628,9 @@ async def handle_connection(ws):
                     except Exception as e:
                         logger.error(f"Opus codec error: {e}")
                         negotiated_fmt = "pcm"
+                _connections[device_id] = {"ws": ws, "opus_encoder": opus_encoder}
+                # Напоминания, накопленные офлайн: отдать сразу после hello.
+                asyncio.create_task(_deliver_pending_reminders_on_hello(ws, device_id))
                 continue
 
             if not hello_done:
@@ -2335,6 +2722,8 @@ async def handle_connection(ws):
                     listening = False
                     processing = True
                     tts_active = True
+                    _set_busy(device_id, True)
+                    had_conversation = True
                     pipeline_task = asyncio.create_task(
                         _process_audio_pipeline(
                             ws, audio_buffer, device_id,
@@ -2354,6 +2743,7 @@ async def handle_connection(ws):
                         pipeline_task.cancel()
                     tts_active = False
                     processing = False
+                    _set_busy(device_id, False)
                     aborted = True
                     pending_listen = False
                     vad.reset()
@@ -2362,6 +2752,7 @@ async def handle_connection(ws):
                 audio_buffer.clear()
                 listening = False
                 processing = False
+                _set_busy(device_id, False)
                 aborted = True
                 pending_listen = False
                 vad.reset()
@@ -2379,25 +2770,6 @@ async def handle_connection(ws):
             else:
                 logger.info(f"📨 [{device_id}] Msg: type={msg_type} state={state}")
 
-        # ── End-of-conversation prompt ──
-        if END_PROMPT_ENABLED and hello_done and not _end_prompt_sent:
-            idle_time = time.time() - _last_voice_time
-            if idle_time > END_PROMPT_TIMEOUT:
-                _end_prompt_sent = True
-                logger.info(f"👋 [{device_id}] End-of-conversation prompt (idle {idle_time:.0f}s)")
-                try:
-                    await ws.send(json.dumps({"type": "tts", "state": "start", "session_id": session_id}))
-                    await ws.send(json.dumps({"type": "tts", "state": "sentence_start", "text": END_PROMPT_TEXT, "session_id": session_id}))
-                    pcm_bytes, sr = await run_tts(END_PROMPT_TEXT)
-                    if pcm_bytes:
-                        rate_ctrl = AudioRateController(downlink_sr=getattr(opus_encoder, "_downlink_sr", 16000))
-                        await rate_ctrl.start(ws, opus_encoder)
-                        await rate_ctrl.enqueue(_pcm_to_wav(pcm_bytes, sr))
-                        await rate_ctrl.stop()
-                    await ws.send(json.dumps({"type": "tts", "state": "stop", "session_id": session_id}))
-                except Exception:
-                    pass
-
     except websockets.exceptions.ConnectionClosed as e:
         logger.info(f"📱 Disconnected: {remote} (code={e.code})")
     except Exception as e:
@@ -2405,6 +2777,8 @@ async def handle_connection(ws):
     finally:
         if device_id and device_id in _devices:
             _devices[device_id]["connected"] = False
+            _devices[device_id]["busy"] = False
+        _connections.pop(device_id, None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2440,8 +2814,9 @@ async def main():
     logger.info(f" Exit cmds: {EXIT_COMMANDS}")
     logger.info(f" Opus: {'available' if OPUS_AVAILABLE else 'NOT installed'}")
     logger.info(f" Timezone: {OTA_TIMEZONE}")
+    logger.info(f" Music: {MUSIC_MODE}, reminders: {REMINDERS_FILE}")
     logger.info("=" * 60)
-    await asyncio.gather(run_http(), run_websocket())
+    await asyncio.gather(run_http(), run_websocket(), reminder_scheduler())
 
 
 if __name__ == "__main__":

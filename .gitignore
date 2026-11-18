@@ -34,3 +34,4 @@ test_tts_rvc copy.py
 test_tts_rvc.py
 test_tts_standalone.py
 test_tts_stream.py
+legacy/*
